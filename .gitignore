@@ -1,0 +1,7 @@
+/dist/
+/condoo
+/condoo.exe
+# Written by Herdr or the installer inside an installed mod folder
+mods/condoo/bin.json
+mods/condoo/jsconfig.json
+mods/condoo/*.d.ts

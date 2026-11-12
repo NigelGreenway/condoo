@@ -1,0 +1,81 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go vet ./...
+      - run: go test -race ./...
+        if: runner.os != 'Windows'
+      - run: go test ./...
+        if: runner.os == 'Windows'
+
+  panel:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: node --test test/*.test.mjs
+      - run: node --check mods/condoo/main.js && node --check mods/condoo/spaces.js
+
+  installer-unix:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Install, use, upgrade, uninstall (in a scratch home)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          export HOME="$RUNNER_TEMP/home" && unset XDG_CONFIG_HOME XDG_DATA_HOME XDG_CACHE_HOME
+          mkdir -p "$HOME/herdr"
+          sh install.sh --yes --herdr-home "$HOME/herdr" --name "CI User"
+          "$HOME/.local/bin/condoo" ask "Does it work?" -s smoke | grep '"waiting_on":"CI User"'
+          test -f "$HOME/herdr/mods/condoo/main.js"
+          grep -q '"path"' "$HOME/herdr/mods/condoo/bin.json"
+          sh install.sh --yes --herdr-home "$HOME/herdr"
+          "$HOME/.local/bin/condoo" list | grep -q 'Does it work?'
+          sh install.sh --uninstall --yes --herdr-home "$HOME/herdr"
+          test ! -e "$HOME/.local/bin/condoo" && test ! -d "$HOME/herdr/mods/condoo"
+
+  installer-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Install, use, upgrade, uninstall
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $herdr = Join-Path $env:RUNNER_TEMP "herdr"; New-Item -ItemType Directory $herdr | Out-Null
+          $dir = Join-Path $env:RUNNER_TEMP "Condoo"
+          ./install.ps1 -Yes -InstallDir $dir -HerdrHome $herdr -Name "CI User"
+          $q = & "$dir\condoo.exe" ask "Does it work?" -s smoke | ConvertFrom-Json
+          if ($q.waiting_on -ne "CI User") { throw "waiting_on: $($q.waiting_on)" }
+          if (-not (Test-Path "$herdr\mods\condoo\bin.json")) { throw "no bin.json" }
+          ./install.ps1 -Yes -InstallDir $dir -HerdrHome $herdr
+          if (-not ((& "$dir\condoo.exe" list) -match 'Does it work')) { throw "list lost the item" }
+          ./install.ps1 -Uninstall -Yes -InstallDir $dir -HerdrHome $herdr
+          if (Test-Path "$dir\condoo.exe") { throw "exe still there" }
