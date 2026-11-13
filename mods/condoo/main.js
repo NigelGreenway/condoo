@@ -3,10 +3,11 @@
 // keys (see key()).
 //
 // One mod, several roles:
-//   - the panel: a block showing this mod in your layout (any id; hidden until toggled), or,
+//   - the panel: a block showing this mod in your layout (any id), or,
 //     in a layout without one, a dialog (props.role "panel").
-//   - the toggle: opened by `mod.open:condoo`. It closes itself at once, then shows + focuses
-//     the panel, or hides it and gives the keyboard back to the pane.
+//   - the focus key: opened by `mod.open:condoo`. It closes itself at once, then shows the
+//     panel (and any hidden column around it) and gives it the keyboard. It never hides it:
+//     hide the column it sits in with your sidebar key instead.
 //   - the answer bar (props.role "answer-bar"): the title over the editor terminal in the
 //     answer dialog. Enter on a question opens $EDITOR there; on exit the answer is stored and
 //     typed into the asking agent if it's idle.
@@ -74,8 +75,8 @@ const HELP = [
     ["f", "filter by status"],
     ["c", "show / hide completed and cancelled"],
     ["r", "reload"],
-    ["esc", "back to the pane (panel stays open)"],
-    ["q  {toggle}", "hide the panel"],
+    ["esc  q", "back to the pane (panel stays open)"],
+    ["{toggle}", "show the panel and focus it"],
     ["?", "this help"],
   ]],
   ["Editing", null, [
@@ -97,26 +98,27 @@ function palette(dark) {
 
 // The layout block that shows this mod, found by its content rather than its id, so any
 // block a person or agent adds (`{ "content": { "mod": "condoo" } }`) works. It needs an id
-// for layout.show/hide; without one the panel opens as a dialog instead.
-function findBlock(n) {
+// for layout.show; without one the panel opens as a dialog instead. Returns the block and
+// every node above it, outermost first: showing the block alone does nothing while the
+// column it sits in is hidden.
+function pathTo(n, path = []) {
   if (!n || typeof n !== "object") return null;
-  if (n.content?.mod === MOD && n.id) return n;
+  const here = [...path, n];
+  if (n.content?.mod === MOD && n.id) return here;
   for (const c of [...(n.children ?? []), ...(n.floating ?? [])]) {
-    const r = findBlock(c);
+    const r = pathTo(c, here);
     if (r) return r;
   }
   return null;
 }
 
 const panelShown = () => {
-  const n = findBlock(layout());
-  return Boolean(n && !n.hidden);
+  const path = pathTo(layout());
+  return Boolean(path && !path.some((n) => n.hidden));
 };
 
-const blockId = () => findBlock(layout())?.id ?? null;
-
-// The key bound to the toggle, for the help.
-const toggleKey = () => keys().find((k) => k.action === "mod.open:condoo")?.keys ?? "your toggle key";
+// The key bound to the focus key, for the help.
+const toggleKey = () => keys().find((k) => k.action === "mod.open:condoo")?.keys ?? "your focus key";
 
 // The installer records where it put the binary in bin.json, so the panel works even when
 // that folder isn't on the PATH Herdr sees. Without it: `condoo` from PATH.
@@ -165,7 +167,7 @@ export default class Condoo extends View {
       cx.timer.after(30, () => this.h.focus());
       return;
     }
-    if (props()?.overlay && props()?.role !== "panel") return this.toggle(cx);
+    if (props()?.overlay && props()?.role !== "panel") return this.focusPanel(cx);
 
     this.tasks = [];
     this.loaded = false;
@@ -215,32 +217,20 @@ export default class Condoo extends View {
     return props()?.role === "panel" || panelShown();
   }
 
-  // The toggle key: show and focus the panel, or hide it and hand the keyboard back.
-  // Layouts without a `condoo` block get the panel as a dialog instead.
-  toggle(_cx) {
-    const own = props().overlay;
-    closeOverlay(own);
-    const id = blockId();
-    if (!id) {
-      const open = shared(DIALOG);
-      if (open) {
-        closeOverlay(open);
-        setShared(DIALOG, null);
-      } else {
+  // The focus key: show the panel (and any hidden node around it) and give it the keyboard.
+  // It never hides anything. Layouts without a `condoo` block get the panel as a dialog instead.
+  focusPanel(_cx) {
+    closeOverlay(props().overlay);
+    const path = pathTo(layout());
+    if (!path) {
+      if (!shared(DIALOG)) {
         setShared(DIALOG, openOverlay({ mod: "condoo", props: { role: "panel" }, kind: "dialog", width: 420, height: 0.85 }));
-        setShared(FOCUS, Date.now());
       }
+      setShared(FOCUS, Date.now());
       return;
     }
-    const shown = panelShown();
-    if (shown) {
-      run("layout.hide", { id });
-      const pane = focused()?.pane;
-      if (pane) run("pane.focus", { pane });
-    } else {
-      run("layout.show", { id });
-      setShared(FOCUS, Date.now());
-    }
+    for (const n of path) if (n.hidden && n.id) run("layout.show", { id: n.id });
+    setShared(FOCUS, Date.now());
   }
 
   // ---------- data ----------
@@ -523,10 +513,10 @@ export default class Condoo extends View {
     } else if (ch === "r") {
       this.reload(cx);
     } else if (ch === "q" || e.key === "escape") {
-      // In a block, esc hands the keyboard back and leaves the panel open; as a dialog there's
-      // nothing to leave open, so esc closes it like q.
-      if (e.key === "escape" && props()?.role !== "panel") { const pane = focused()?.pane; if (pane) run("pane.focus", { pane }); }
-      else this.toggle_hide();
+      // In a block, esc and q hand the keyboard back and leave the panel open (the sidebar key
+      // hides its column); as a dialog there's nothing to leave open, so they close it.
+      if (props()?.role !== "panel") { const pane = focused()?.pane; if (pane) run("pane.focus", { pane }); }
+      else this.closeDialog();
     } else if (!task) {
       handled = false;
     } else if (ch === " " || e.key === "space") {
@@ -560,16 +550,9 @@ export default class Condoo extends View {
     if (handled) { cx.stop_propagation(); cx.notify(); }
   }
 
-  toggle_hide() {
-    if (props()?.role === "panel") {
-      setShared(DIALOG, null);
-      closeOverlay(props().overlay);
-      return;
-    }
-    const id = blockId();
-    if (id) run("layout.hide", { id });
-    const pane = focused()?.pane;
-    if (pane) run("pane.focus", { pane });
+  closeDialog() {
+    setShared(DIALOG, null);
+    closeOverlay(props().overlay);
   }
 
   // ---------- drawing ----------
@@ -589,7 +572,7 @@ export default class Condoo extends View {
       cx.timer.after(0, (cx) => this.reload(cx));
     }
 
-    // The toggle key asked for the keyboard.
+    // The focus key asked for the keyboard.
     const token = shared(FOCUS);
     if (token && token !== this.focusToken) {
       this.focusToken = token;
@@ -708,7 +691,7 @@ export default class Condoo extends View {
     return v_flex().id("condoo-root").size_full().bg(t.chrome).text_color(t.foreground)
       .track_focus(this.h).on_key_down((e, cx) => this.key(e, cx))
       .on_mouse_down("left", () => { if (this.mode !== "edit") this.h.focus(); })
-      .child(h_flex().flex_none().h(36).px(12).gap(8).items_center().border_b_1().border_color(t.border)
+      .child(h_flex().flex_none().h(42).px(12).gap(8).items_center().border_b_1().border_color(t.border)
         .child(div().text_size(13).font_semibold().text_color(focusedNow ? t.foreground : t.muted).child("Condoo"))
         .child(div().flex_1())
         .child(h_flex().gap(6).text_size(11)

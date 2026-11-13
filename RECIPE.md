@@ -74,10 +74,11 @@ resizable) or a 420px × 85% dialog.
 
 ## How it behaves
 
-- **The toggle key** (`mod.open:condoo`):
-  - In a layout with a block showing the `condoo` mod, it shows and focuses that block, or
-    hides it and gives the keyboard back to the pane.
-  - Without such a block, it opens or closes the panel as a dialog.
+- **The focus key** (`mod.open:condoo`) only ever shows and focuses; it never hides:
+  - In a layout with a block showing the `condoo` mod, it shows that block and any hidden
+    node above it (the column it sits in), then gives it the keyboard. `q` and Esc hand the
+    keyboard back and leave it open; hide its column with the layout's sidebar key.
+  - Without such a block, it opens the panel as a dialog (or refocuses it if open).
 - **Agents add items** from their terminal: `condoo ask "title" -s summary -d description
   --agent "Claude (task)" --priority high`, or `condoo request ...`. Their terminal address
   comes from `$HC_TERMINAL_ID`. Each item is filed under the Herdr space that terminal is in.
@@ -264,9 +265,9 @@ with exit code 1, or 2 for a misused command.
   `status: "discussion"` and `waiting_on` set to your name. Run inside Herdr, the item also has
   the terminal's `space`.
 - With the toggle key bound and no `condoo` block in the layout, the key opens a 420px dialog
-  listing the item under Questions with its summary. A second press, `q` or Esc closes it.
-- After an agent adds a block showing `condoo` with any id, the key slides that block in and
-  out, and the dialog no longer opens.
+  listing the item under Questions with its summary. A second press refocuses it; `q` or Esc closes it.
+- After an agent adds a block showing `condoo` with any id, the key shows and focuses that
+  block (and its hidden column), never hides it, and the dialog no longer opens.
 - On the question, Enter opens the answer dialog with your editor. Write a line, save and
   quit: the question turns Completed in green, shows "↪" and your line, and the asking
   terminal receives `Answer to your question (condoo #N) "Test?":` followed by the answer.
