@@ -48,6 +48,8 @@ const SHOWN_COMMENTS = 5; // the latest few; "show N earlier" for the rest
 // f cycles: open (null: everything but completed and cancelled), each status, then all.
 const FILTERS = [null, ...STATUSES, "all"];
 const POLL_MS = 4000;
+const DRAFT_LABEL = "condoo.draft"; // on an editor terminal: what it drafts, "answer:ID" | "comment:ID"
+const PATH_LABEL = "condoo.path";   // on an editor terminal: the draft file
 
 // The `?` dialog: [title, intro, [[keys, what], ...]]
 const HELP = [
@@ -64,11 +66,11 @@ const HELP = [
     ["l", "fold / unfold this item's sub-tasks"],
   ]],
   ["Items", null, [
-    ["enter", "question: answer it in $EDITOR · request: go to the agent · task: edit"],
+    ["enter", "question: answer it in $EDITOR (a draft still open opens again) · request: go to the agent · task: edit"],
     ["a o", "add an item to this section"],
     [">", "add a sub-task"],
     ["e", "edit"],
-    ["c", "comment, in $EDITOR (typed into the agent too, if it's idle)"],
+    ["c", "comment, in $EDITOR (typed into the agent too, if it's idle; a draft still open opens again)"],
     ["s S", "next / previous status"],
     ["p P", "next / previous priority"],
     ["m", "move to another space (with its sub-tasks)"],
@@ -203,6 +205,10 @@ export default class Condoo extends View {
 
     this.h = cx.focus_handle();
     this.scroll = ScrollHandle.new();
+    this.starting = new Set(); // draft keys whose editor is being started
+    this.waiting = new Set();  // editor addresses this copy saves when they exit
+    this.dialogs = new Map();  // editor address → the dialog showing it
+    this.adoptDrafts(cx);
     this.inputs = {};
     for (const f of FIELDS) {
       if (f === "description") {
@@ -536,7 +542,7 @@ export default class Condoo extends View {
       if (this.expanded) this.markSeen(task, cx);
       this.reveal = true;
     } else if (ch === "c") {
-      this.comment(task, cx);
+      this.draft("comment", task, cx);
     } else if (ch === "e") {
       this.startEdit(task, null, cx);
     } else if (ch === ">") {
@@ -556,7 +562,7 @@ export default class Condoo extends View {
     } else if (ch === "x") {
       this.mode = "confirm";
     } else if (e.key === "enter") {
-      if (task.kind === "question") this.answer(task, cx);
+      if (task.kind === "question") this.draft("answer", task, cx);
       else if (task.terminal) run("agent.focus", { terminal: task.terminal });
       else this.startEdit(task, null, cx);
     } else {
@@ -595,6 +601,7 @@ export default class Condoo extends View {
     }
 
     const rows = this.rows();
+    const drafts = this.liveDrafts();
     const sel = this.mode === "edit" ? null : this.current(rows);
     const focusedNow = this.h.is_focused() || this.mode === "edit";
     const statusColor = (s) => ({
@@ -668,6 +675,9 @@ export default class Condoo extends View {
             .when(this.folded.has(task.id) && this.hasKids(task), (el) => el.child(div().flex_none().px(5).rounded(4)
               .bg(t.raised).text_size(10.5).text_color(t.muted)
               .child(`+${this.tasks.filter((x) => x.parent_id === task.id).length}`)))
+            .when(drafts.has(`answer:${task.id}`) || drafts.has(`comment:${task.id}`), (el) => el.child(
+              h_flex().flex_none().gap(3).px(5).rounded(4).bg(t.raised).text_size(10.5).text_color(t.blocked)
+                .child("✎").child(drafts.has(`answer:${task.id}`) ? "answer open" : "comment open")))
             .when(task.comments?.length > 0, (el) => el.child(svg("mods/condoo/megaphone.svg").size(13).flex_none()
               .text_color(t.ansi3).opacity(unread(task) ? 1 : 0.4)))
             .when(full, (el) => el.child(div().flex_none().opacity(0.4).text_size(11).text_color(t.foreground).child(`${days}d`))))
@@ -741,34 +751,103 @@ export default class Condoo extends View {
     cx.notify();
   }
 
-  // $EDITOR in a dialog on a draft condoo wrote (`fileCmd ID` → {path, editor}); resolves with
-  // the draft's path once the editor exits. condoo picks the editor ($VISUAL, $EDITOR, else
-  // one it finds), so no shell is needed and Windows works too.
-  async editDraft(cx, fileCmd, task, bar) {
-    const { path, editor } = await cli([fileCmd, String(task.id)]);
-    const r = await hc(["run", "--json", "--bg", "--no-parent", "--cwd", home(), "--", ...editor, path]);
-    const addr = JSON.parse(r.stdout).address;
-    if (!addr) throw new Error(r.stderr.trim() || "couldn't start the editor");
-    const overlay = openOverlay({
+  // ---------- drafts: $EDITOR on an answer or comment ----------
+  //
+  // The editor is a background terminal labelled with what it drafts (DRAFT_LABEL "answer:ID")
+  // and where (PATH_LABEL). The dialog only shows it: closing the dialog (Esc, another mod)
+  // leaves the editor running, the item shows "draft open", and Enter / c opens it again.
+  // The draft is saved when the editor exits. A panel that starts (or reloads) takes over
+  // editors left running, so an answer is never lost with the copy that started it.
+
+  // Editors still running, from their labels: "answer:40" → {kind, id, addr, path}.
+  liveDrafts() {
+    const out = new Map();
+    for (const term of terminals()) {
+      const key = term.labels?.[DRAFT_LABEL];
+      const m = /^(answer|comment):(\d+)$/.exec(key ?? "");
+      if (m && term.state === "live") {
+        out.set(key, { kind: m[1], id: Number(m[2]), addr: term.address, path: term.labels[PATH_LABEL] });
+      }
+    }
+    return out;
+  }
+
+  // Enter on a question, c on any item: open its editor again if it's running, else start one.
+  draft(kind, task, cx) {
+    const key = `${kind}:${task.id}`;
+    const running = this.liveDrafts().get(key);
+    if (running) return this.showDraft(running, task, cx);
+    if (this.starting.has(key)) return;
+    this.starting.add(key);
+    cx.spawn(async (cx) => {
+      try {
+        // condoo writes the draft and picks the editor ($VISUAL, $EDITOR, else one it finds),
+        // so no shell is needed and Windows works too.
+        const { path, editor } = await cli([`${kind}-file`, String(task.id)]);
+        const r = await hc(["run", "--json", "--bg", "--no-parent", "--cwd", home(),
+          "--label", `${DRAFT_LABEL}=${key}`, "--label", `${PATH_LABEL}=${path}`, "--", ...editor, path]);
+        const addr = JSON.parse(r.stdout || "{}").address;
+        if (!addr) throw new Error(r.stderr.trim() || "couldn't start the editor");
+        const d = { kind, id: task.id, addr, path };
+        this.showDraft(d, task, cx);
+        this.starting.delete(key);
+        await this.awaitDraft(d, task, cx);
+      } catch (e) {
+        this.starting.delete(key);
+        notify({ title: `Condoo: ${kind === "answer" ? "answering" : "commenting"} failed`, body: String(e.message ?? e), level: "error", timeout: 6000 });
+      }
+    });
+  }
+
+  // The dialog over the editor. Opening it again replaces any earlier one for the same editor.
+  showDraft(d, task, cx) {
+    const old = this.dialogs.get(d.addr);
+    if (old) closeOverlay(old);
+    const bar = d.kind === "answer"
+      ? { label: "Answer", agent: task?.agent && `for ${task.agent}` }
+      : { label: "Comment", agent: `on #${d.id}` };
+    const term = terminals().find((x) => x.address === d.addr);
+    this.dialogs.set(d.addr, openOverlay({
       kind: "dialog", modal: true, width: 0.6, height: 0.6,
       layout: { type: "column", children: [
         { type: "block", size: { px: 30 }, content: { mod: "condoo",
-          props: { role: "answer-bar", ...bar, title: task.title, terminal: addr, editor: editor[0] } } },
-        { type: "block", content: { terminal: addr } },
+          props: { role: "answer-bar", ...bar, title: task?.title ?? `#${d.id}`, terminal: d.addr, editor: term?.argv?.[0] ?? "" } } },
+        { type: "block", content: { terminal: d.addr } },
       ] },
-    });
-    try {
-      await cx.sleep(150);
-      run("pane.focus", { terminal: addr });
-      for (;;) {
-        await cx.sleep(400);
-        const term = terminals().find((x) => x.address === addr);
-        if (!term || term.state !== "live") break;
-      }
-    } finally {
-      closeOverlay(overlay);
+    }));
+    cx.timer.after(150, () => run("pane.focus", { terminal: d.addr }));
+    cx.notify();
+  }
+
+  // Waits for the editor to exit, then saves the draft and tells the item's agent.
+  async awaitDraft(d, task, cx) {
+    this.waiting.add(d.addr);
+    for (;;) {
+      await cx.sleep(400);
+      const term = terminals().find((x) => x.address === d.addr);
+      if (!term || term.state !== "live") break;
     }
-    return path;
+    this.waiting.delete(d.addr);
+    const dialog = this.dialogs.get(d.addr);
+    this.dialogs.delete(d.addr);
+    if (dialog) closeOverlay(dialog);
+    task = this.tasks.find((x) => x.id === d.id) ?? task ?? { id: d.id, title: `#${d.id}` };
+    try {
+      if (!d.path) throw new Error(`no draft path for #${d.id}`);
+      await (d.kind === "answer" ? this.saveAnswer(task, d.path) : this.saveComment(task, d.path));
+    } catch (e) {
+      notify({ title: `Condoo: saving the ${d.kind} failed`, body: String(e.message ?? e), level: "error", timeout: 6000 });
+    }
+    this.h.focus();
+    this.reload(cx);
+  }
+
+  // Editors left running by an earlier copy of the panel (a reload): wait on them here.
+  adoptDrafts(cx) {
+    for (const d of this.liveDrafts().values()) {
+      if (this.waiting.has(d.addr)) continue;
+      cx.spawn(async (cx) => this.awaitDraft(d, null, cx));
+    }
   }
 
   // Types a message into the item's agent if it's still running and idle. Returns
@@ -779,59 +858,33 @@ export default class Condoo extends View {
     return sent.code === 0 ? "sent" : "busy";
   }
 
-  // Enter on a question: $EDITOR in a dialog; on exit store the answer and hand it to the agent.
-  answer(task, cx) {
-    if (this.answering) return;
-    this.answering = task.id;
-    cx.spawn(async (cx) => {
-      try {
-        const path = await this.editDraft(cx, "answer-file", task, { label: "Answer", agent: task.agent && `for ${task.agent}` });
-        const out = await cli(["answer-save", String(task.id), path]);
-        const who = task.agent || task.terminal;
-        if (out.cancelled) {
-          notify({ title: "No answer saved", body: task.title, level: "info", timeout: 3000 });
-        } else {
-          const told = await this.tellAgent(task, `Answer to your question (condoo #${task.id}) "${task.title}":\n\n${out.answer}`);
-          notify(told === "sent" ? { title: `Answer sent to ${who}`, body: task.title, level: "success", timeout: 3000 }
-            : told === "busy" ? { title: "Answer saved, not sent", body: `${who} is busy. It can read it with condoo get ${task.id}.`, level: "warning", timeout: 6000 }
-            : { title: "Answer saved", body: task.title, level: "success", timeout: 3000 });
-        }
-      } catch (e) {
-        notify({ title: "Condoo: answering failed", body: String(e.message ?? e), level: "error", timeout: 6000 });
-      }
-      this.answering = null;
-      this.h.focus();
-      this.reload(cx);
-    });
+  // Enter on a question: store the answer and hand it to the agent.
+  async saveAnswer(task, path) {
+    const out = await cli(["answer-save", String(task.id), path]);
+    const who = task.agent || task.terminal;
+    if (out.cancelled) {
+      return notify({ title: "No answer saved", body: task.title, level: "info", timeout: 3000 });
+    }
+    const told = await this.tellAgent(task, `Answer to your question (condoo #${task.id}) "${task.title}":\n\n${out.answer}`);
+    notify(told === "sent" ? { title: `Answer sent to ${who}`, body: task.title, level: "success", timeout: 3000 }
+      : told === "busy" ? { title: "Answer saved, not sent", body: `${who} is busy. It can read it with condoo get ${task.id}.`, level: "warning", timeout: 6000 }
+      : { title: "Answer saved", body: task.title, level: "success", timeout: 3000 });
   }
 
-  // c: a comment in $EDITOR, posted as the person and typed into the item's agent if it's idle.
-  comment(task, cx) {
-    if (this.answering) return;
-    this.answering = task.id;
-    cx.spawn(async (cx) => {
-      try {
-        const path = await this.editDraft(cx, "comment-file", task, { label: "Comment", agent: `on #${task.id}` });
-        const out = await cli(["comment-save", String(task.id), path]);
-        const who = task.agent || task.terminal;
-        if (out.cancelled) {
-          notify({ title: "No comment posted", body: task.title, level: "info", timeout: 3000 });
-        } else {
-          this.expanded = task.id;
-          const told = await this.tellAgent(task,
-            `Comment from ${out.author} on condoo #${task.id} "${task.title}":\n\n${out.body}`);
-          notify(told === "sent" ? { title: `Comment sent to ${who}`, body: task.title, level: "success", timeout: 3000 }
-            : told === "busy" ? { title: "Comment saved, not sent", body: `${who} is busy. It can read it with condoo get ${task.id}.`, level: "warning", timeout: 6000 }
-            : { title: "Comment saved", body: task.title, level: "success", timeout: 3000 });
-          await cli(["seen", String(task.id)]);
-        }
-      } catch (e) {
-        notify({ title: "Condoo: commenting failed", body: String(e.message ?? e), level: "error", timeout: 6000 });
-      }
-      this.answering = null;
-      this.h.focus();
-      this.reload(cx);
-    });
+  // c: a comment, posted as the person and typed into the item's agent if it's idle.
+  async saveComment(task, path) {
+    const out = await cli(["comment-save", String(task.id), path]);
+    const who = task.agent || task.terminal;
+    if (out.cancelled) {
+      return notify({ title: "No comment posted", body: task.title, level: "info", timeout: 3000 });
+    }
+    this.expanded = task.id;
+    const told = await this.tellAgent(task,
+      `Comment from ${out.author} on condoo #${task.id} "${task.title}":\n\n${out.body}`);
+    notify(told === "sent" ? { title: `Comment sent to ${who}`, body: task.title, level: "success", timeout: 3000 }
+      : told === "busy" ? { title: "Comment saved, not sent", body: `${who} is busy. It can read it with condoo get ${task.id}.`, level: "warning", timeout: 6000 }
+      : { title: "Comment saved", body: task.title, level: "success", timeout: 3000 });
+    await cli(["seen", String(task.id)]);
   }
 
   // Opening an item reads its comments.

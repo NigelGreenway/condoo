@@ -143,8 +143,14 @@ resizable) or a 420px × 85% dialog.
   1. `condoo answer-file N` writes a draft: the current answer, a cut line, and the question
      as `#` comments under it. It also returns the editor to use: `$VISUAL`, `$EDITOR`, else
      `vim`/`vi`/`nano`, or on Windows `edit`/`nvim`/`vim`/`nano`/`notepad`.
-  2. The editor runs as a core terminal (`hc run --bg --no-parent`) inside the answer dialog,
-     and the panel watches it every 400ms.
+  2. The editor runs as a core terminal (`hc run --bg --no-parent`), labelled
+     `condoo.draft=answer:N` (or `comment:N`) and `condoo.path=<draft>`, and shows inside the
+     answer dialog; the panel watches it every 400ms. The dialog is only a view: if it closes
+     while the editor runs (Esc, another mod closing it), the editor keeps running, the item's
+     title row shows a `raised` chip "✎ answer open" (or "comment open") in `blocked`, and
+     Enter (or `c`) opens the same editor again. Other items can be answered meanwhile. A
+     panel that starts or reloads finds labelled editors still running and saves them when
+     they exit, so a draft outlives the copy that started it.
   3. When the editor exits, `condoo answer-save N` keeps the text above the cut line. If
      it's empty or unchanged, nothing is saved ("No answer saved" toast). Otherwise the
      question becomes completed and waits on the agent.
