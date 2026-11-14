@@ -188,7 +188,8 @@ func TestMigratesOldDatabase(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if old.Title != "old one" || old.Summary != "" || old.Answer != nil || old.Space != nil || old.SpaceName != nil {
+	if old.Title != "old one" || old.Summary != "" || old.Answer != nil || old.Space != nil || old.SpaceName != nil ||
+		old.SeenAt != nil || old.Comments == nil || len(old.Comments) != 0 {
 		t.Errorf("migrated row: %+v", old)
 	}
 	if _, err := s.Update(1, map[string]any{"answer": "yes", "space": "s1", "space_name": "core", "summary": "sum"}); err != nil {
@@ -244,5 +245,50 @@ func TestNoSpaceMeansNoName(t *testing.T) {
 	task, _ := s.Add(NewTask{Title: "x", SpaceName: str("orphan name")})
 	if task.SpaceName != nil {
 		t.Errorf("a name without a space was kept: %v", *task.SpaceName)
+	}
+}
+
+func TestComments(t *testing.T) {
+	s := open(t)
+	task, _ := s.Add(NewTask{Title: "x"})
+	s.Add(NewTask{Title: "y"})
+	if _, err := s.AddComment(task.ID, "Claude", true, "first"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.AddComment(task.ID, "Ada", false, "second"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.AddComment(task.ID, "Ada", false, "  \n"); err == nil {
+		t.Error("accepted an empty comment")
+	}
+	if _, err := s.AddComment(42, "Ada", false, "z"); !errors.As(err, &ErrNotFound{}) {
+		t.Errorf("missing item: %v", err)
+	}
+
+	got, _ := s.Get(task.ID)
+	if len(got.Comments) != 2 || got.Comments[0].Body != "first" || !got.Comments[0].ByAgent ||
+		got.Comments[1].Author != "Ada" || got.Comments[1].ByAgent {
+		t.Errorf("comments: %+v", got.Comments)
+	}
+	if got.UpdatedAt != task.UpdatedAt {
+		t.Error("a comment must not touch updated_at")
+	}
+	all, _ := s.List("")
+	if len(all[0].Comments) != 2 || all[1].Comments == nil || len(all[1].Comments) != 0 {
+		t.Errorf("listed: %+v", all)
+	}
+
+	seen, err := s.Seen(task.ID)
+	if err != nil || seen.SeenAt == nil || *seen.SeenAt <= got.Comments[1].CreatedAt || seen.UpdatedAt != task.UpdatedAt {
+		t.Errorf("seen: %+v %v", seen, err)
+	}
+
+	if err := s.Delete(task.ID); err != nil {
+		t.Fatal(err)
+	}
+	var n int
+	s.db.QueryRow("SELECT count(*) FROM comments").Scan(&n)
+	if n != 0 {
+		t.Errorf("%d comments outlived their item", n)
 	}
 }

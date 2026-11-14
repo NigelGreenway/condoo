@@ -445,3 +445,58 @@ func jsonID(m map[string]any) string {
 	b, _ := json.Marshal(m["id"])
 	return string(b)
 }
+
+func TestComments(t *testing.T) {
+	h := newHarness(t)
+	id := jsonID(h.ok("ask", "Pick one?", "--agent", "Claude"))
+
+	c := h.ok("comment", id, "From the agent", "--agent", "Claude (lead)")
+	if c["author"] != "Claude (lead)" || c["by_agent"] != true {
+		t.Errorf("agent comment: %v", c)
+	}
+	h.env["CONDOO_AGENT"] = "Codex"
+	if c := h.ok("comment", id, "env"); c["author"] != "Codex" || c["by_agent"] != true {
+		t.Errorf("$CONDOO_AGENT comment: %v", c)
+	}
+	if c := h.ok("comment", id, "mine", "--agent", ""); c["author"] != "ada" || c["by_agent"] != false {
+		t.Errorf("own comment: %v", c)
+	}
+	if code, _ := h.run("comment", id, " "); code != 1 {
+		t.Errorf("empty comment: exit %d", code)
+	}
+	if code, _ := h.run("comment", id); code != 2 {
+		t.Errorf("no text: exit %d", code)
+	}
+
+	got := h.ok("get", id)
+	if cs := got["comments"].([]any); len(cs) != 3 || cs[0].(map[string]any)["body"] != "From the agent" {
+		t.Errorf("get comments: %v", got["comments"])
+	}
+	if got["seen_at"] != nil {
+		t.Errorf("seen_at before seen: %v", got["seen_at"])
+	}
+	if got := h.ok("seen", id); got["seen_at"] == nil {
+		t.Error("seen didn't record seen_at")
+	}
+
+	// The panel's draft round trip: posted as the person, even with $CONDOO_AGENT set.
+	f := h.ok("comment-file", id)
+	path := f["path"].(string)
+	draft, _ := os.ReadFile(path)
+	for _, want := range []string{CommentCut, "# Comment on #" + id + ": Pick one?", "# Claude (lead):", "#   From the agent"} {
+		if !strings.Contains(string(draft), want) {
+			t.Errorf("draft lacks %q:\n%s", want, draft)
+		}
+	}
+	if got := h.ok("comment-save", id, path); got["cancelled"] != true {
+		t.Errorf("empty draft: %v", got)
+	}
+	h.ok("comment-file", id)
+	os.WriteFile(path, []byte("Go with B.\r\n\r\n"+CommentCut+"\r\n# Comment on\r\n"), 0o600)
+	if got := h.ok("comment-save", id, path); got["body"] != "Go with B." || got["author"] != "ada" || got["by_agent"] != false {
+		t.Errorf("posted: %v", got)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Error("the draft must be removed")
+	}
+}

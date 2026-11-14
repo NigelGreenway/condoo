@@ -257,7 +257,7 @@ elif confirm "Install the panel into $MOD_DIR?" y; then
 	fi
 	mkdir -p "$MOD_DIR"
 	# Only the mod's own files: Herdr's jsconfig.json / .d.ts and bin.json are left as they are.
-	for f in "$src"/*.js "$src/mod.json"; do
+	for f in "$src"/*.js "$src"/*.svg "$src/mod.json"; do
 		case "$f" in *.d.ts) continue ;; esac
 		cp "$f" "$MOD_DIR/"
 	done

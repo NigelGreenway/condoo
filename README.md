@@ -66,12 +66,19 @@ to any space, or to Personal.
 | `j` `k` | move |
 | `enter` | answer a question in your editor, go to a request's agent, or edit a task |
 | `a` | add an item; `>` adds a sub-task |
+| `space` | show the description and comments |
+| `c` | comment on an item in your editor |
 | `s` `p` | change status / priority |
 | `m` | move to another space |
+| `f` | filter: open, each status, all |
 | `x` | delete |
 | `?` | every key |
 
-Answers open in `$VISUAL` or `$EDITOR`. Without one set: `vim`, `vi` or `nano`, or on Windows
+A yellow megaphone marks an item with comments: faint once you've read them, bright when an
+agent has commented since you last opened it. Your comment is also typed into the item's
+agent if it's idle.
+
+Answers and comments open in `$VISUAL` or `$EDITOR`. Without one set: `vim`, `vi` or `nano`, or on Windows
 `edit`, `nvim`, `vim`, `nano` or `notepad`, whichever is found first.
 
 ## The command
@@ -84,6 +91,8 @@ condoo add "Review the migration"          # one of your own tasks
 condoo list                                # everything, as JSON
 condoo get 12                              # one item, with its answer
 condoo set 12 --status completed
+condoo comment 12 "Done for menu-service" --agent "Claude (TICKET-123)"
+condoo comments 12                         # its comments (get includes them too)
 condoo move 12 --space <space id>          # with its sub-items; --space "" for none
 condoo --help
 ```

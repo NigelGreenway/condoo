@@ -45,6 +45,15 @@ CREATE TABLE IF NOT EXISTS tasks (
   space_name   TEXT
 );
 CREATE INDEX IF NOT EXISTS tasks_parent ON tasks(parent_id);
+CREATE TABLE IF NOT EXISTS comments (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  task_id    INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  author     TEXT NOT NULL DEFAULT '',
+  by_agent   INTEGER NOT NULL DEFAULT 0,
+  body       TEXT NOT NULL DEFAULT '',
+  created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS comments_task ON comments(task_id);
 `
 
 // Task is one item, as JSON for the panel and agents.
@@ -68,6 +77,20 @@ type Task struct {
 	// SpaceName is the space's name when last seen, so items can follow a space that's
 	// closed and opened again (a new id, the same name).
 	SpaceName *string `json:"space_name"`
+	// SeenAt is when the person last opened the item in the panel: agents' comments after it
+	// are unread.
+	SeenAt   *float64  `json:"seen_at"`
+	Comments []Comment `json:"comments"` // oldest first
+}
+
+// Comment is one note on an item, by the person or an agent.
+type Comment struct {
+	ID        int64   `json:"id"`
+	TaskID    int64   `json:"task_id"`
+	Author    string  `json:"author"`
+	ByAgent   bool    `json:"by_agent"`
+	Body      string  `json:"body"`
+	CreatedAt float64 `json:"created_at"`
 }
 
 // NewTask is what add/ask/request create.
@@ -149,6 +172,7 @@ func migrate(db *sql.DB) error {
 		{"summary", "ALTER TABLE tasks ADD COLUMN summary TEXT NOT NULL DEFAULT ''"},
 		{"space", "ALTER TABLE tasks ADD COLUMN space TEXT"},
 		{"space_name", "ALTER TABLE tasks ADD COLUMN space_name TEXT"},
+		{"seen_at", "ALTER TABLE tasks ADD COLUMN seen_at REAL"},
 	} {
 		if !have[add.col] {
 			if _, err := db.Exec(add.ddl); err != nil {
@@ -183,7 +207,7 @@ func Check(field, value string) error {
 }
 
 const columns = "id, parent_id, kind, title, description, status, priority, waiting_on, agent, terminal," +
-	" created_at, updated_at, status_since, answer, summary, space, space_name"
+	" created_at, updated_at, status_since, answer, summary, space, space_name, seen_at"
 
 type scanner interface{ Scan(...any) error }
 
@@ -194,9 +218,10 @@ func scan(r scanner) (*Task, error) {
 		agent, term, answer, spce sql.NullString
 		spaceName                 sql.NullString
 		summary, waiting          sql.NullString
+		seen                      sql.NullFloat64
 	)
 	err := r.Scan(&t.ID, &parent, &t.Kind, &t.Title, &t.Description, &t.Status, &t.Priority, &waiting,
-		&agent, &term, &t.CreatedAt, &t.UpdatedAt, &t.StatusSince, &answer, &summary, &spce, &spaceName)
+		&agent, &term, &t.CreatedAt, &t.UpdatedAt, &t.StatusSince, &answer, &summary, &spce, &spaceName, &seen)
 	if err != nil {
 		return nil, err
 	}
@@ -205,6 +230,10 @@ func scan(r scanner) (*Task, error) {
 	}
 	t.Agent, t.Terminal, t.Answer, t.Space, t.SpaceName = ptr(agent), ptr(term), ptr(answer), ptr(spce), ptr(spaceName)
 	t.Summary, t.WaitingOn = summary.String, waiting.String
+	if seen.Valid {
+		t.SeenAt = &seen.Float64
+	}
+	t.Comments = []Comment{}
 	return &t, nil
 }
 
@@ -221,7 +250,33 @@ func (s *Store) Get(id int64) (*Task, error) {
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound{id}
 	}
-	return t, err
+	if err != nil {
+		return nil, err
+	}
+	byTask, err := s.comments("WHERE task_id = ?", id)
+	if err != nil {
+		return nil, err
+	}
+	t.Comments = append(t.Comments, byTask[id]...)
+	return t, nil
+}
+
+// comments returns the matching comments by item, oldest first.
+func (s *Store) comments(where string, args ...any) (map[int64][]Comment, error) {
+	rows, err := s.db.Query("SELECT id, task_id, author, by_agent, body, created_at FROM comments "+where+" ORDER BY id", args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[int64][]Comment{}
+	for rows.Next() {
+		var c Comment
+		if err := rows.Scan(&c.ID, &c.TaskID, &c.Author, &c.ByAgent, &c.Body, &c.CreatedAt); err != nil {
+			return nil, err
+		}
+		out[c.TaskID] = append(out[c.TaskID], c)
+	}
+	return out, rows.Err()
 }
 
 // List returns every item (of one kind, if given), oldest first.
@@ -246,7 +301,17 @@ func (s *Store) List(kind string) ([]Task, error) {
 		}
 		out = append(out, *t)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	byTask, err := s.comments("")
+	if err != nil {
+		return nil, err
+	}
+	for i := range out {
+		out[i].Comments = append(out[i].Comments, byTask[out[i].ID]...)
+	}
+	return out, nil
 }
 
 // Add creates an item. A sub-item takes its parent's kind, and its space unless given.
@@ -367,4 +432,35 @@ func (s *Store) Move(id int64, space, name *string) (*Task, error) {
 func (s *Store) Delete(id int64) error {
 	_, err := s.db.Exec("DELETE FROM tasks WHERE id = ?", id)
 	return err
+}
+
+// AddComment adds a note to an item. It doesn't change the item's updated_at.
+func (s *Store) AddComment(taskID int64, author string, byAgent bool, body string) (*Comment, error) {
+	if _, err := s.Get(taskID); err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(body) == "" {
+		return nil, errors.New("a comment can't be empty")
+	}
+	c := Comment{TaskID: taskID, Author: author, ByAgent: byAgent, Body: body, CreatedAt: s.now()}
+	res, err := s.db.Exec("INSERT INTO comments (task_id, author, by_agent, body, created_at) VALUES (?,?,?,?,?)",
+		c.TaskID, c.Author, c.ByAgent, c.Body, c.CreatedAt)
+	if err != nil {
+		return nil, err
+	}
+	if c.ID, err = res.LastInsertId(); err != nil {
+		return nil, err
+	}
+	return &c, nil
+}
+
+// Seen records that the person opened an item now, so its comments so far are read.
+func (s *Store) Seen(id int64) (*Task, error) {
+	if _, err := s.Get(id); err != nil {
+		return nil, err
+	}
+	if _, err := s.db.Exec("UPDATE tasks SET seen_at = ? WHERE id = ?", s.now(), id); err != nil {
+		return nil, err
+	}
+	return s.Get(id)
 }

@@ -51,7 +51,7 @@ jobs:
               -ldflags "-s -w -X main.version=$TAG" \
               -o "dist/condoo-$os-$arch$ext" ./cmd/condoo
           done
-          tar -czf dist/condoo-mod.tar.gz mods/condoo/*.js mods/condoo/mod.json
+          tar -czf dist/condoo-mod.tar.gz mods/condoo/*.js mods/condoo/*.svg mods/condoo/mod.json
           cp install.sh install.ps1 AGENTS-snippet.md dist/
           (cd dist && sha256sum * > checksums.txt)
           cat dist/checksums.txt

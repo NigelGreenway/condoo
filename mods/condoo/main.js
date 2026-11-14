@@ -13,7 +13,7 @@
 //     typed into the asking agent if it's idle.
 //   - the help (props.role "help"): `?` opens a dialog summarising the sections and keys.
 
-import { View, div } from "gpui-kit";
+import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input, TextareaState, Textarea, TextView, ScrollHandle } from "gpui-base";
 import {
   props, theme, settings, exec, appHome, home, run, layout, focused, keys, readTextFile, machines,
@@ -44,6 +44,9 @@ const SECTIONS = [
 const FIELDS = ["title", "summary", "description", "waiting_on"];
 const FIELD_LABEL = { title: "Title", summary: "Summary", description: "Description", waiting_on: "Waiting on" };
 const TITLE_SIZE = 13;
+const SHOWN_COMMENTS = 5; // the latest few; "show N earlier" for the rest
+// f cycles: open (null: everything but completed and cancelled), each status, then all.
+const FILTERS = [null, ...STATUSES, "all"];
 const POLL_MS = 4000;
 
 // The `?` dialog: [title, intro, [[keys, what], ...]]
@@ -57,7 +60,7 @@ const HELP = [
     ["j k  ↓ ↑", "next / previous item"],
     ["g G", "first / last item"],
     ["[ ]", "previous / next section (empty ones too)"],
-    ["space", "show / hide the description"],
+    ["space", "show / hide the description and comments"],
     ["l", "fold / unfold this item's sub-tasks"],
   ]],
   ["Items", null, [
@@ -65,6 +68,7 @@ const HELP = [
     ["a o", "add an item to this section"],
     [">", "add a sub-task"],
     ["e", "edit"],
+    ["c", "comment, in $EDITOR (typed into the agent too, if it's idle)"],
     ["s S", "next / previous status"],
     ["p P", "next / previous priority"],
     ["m", "move to another space (with its sub-tasks)"],
@@ -72,8 +76,7 @@ const HELP = [
   ]],
   ["View", null, [
     ["w", "this space / all spaces"],
-    ["f", "filter by status"],
-    ["c", "show / hide completed and cancelled"],
+    ["f", "filter: open → each status → all"],
     ["r", "reload"],
     ["esc  q", "back to the pane (panel stays open)"],
     ["{toggle}", "show the panel and focus it"],
@@ -158,6 +161,17 @@ function save(key, value) {
 
 const next = (list, v, step = 1) => list[(list.indexOf(v) + step + list.length) % list.length];
 
+// An agent commented since the person last opened the item (their own comments never count).
+const unread = (task) => (task.comments ?? []).some((c) => c.by_agent && c.created_at > (task.seen_at ?? 0));
+
+// "just now", "12m ago", "3h ago", "2d ago".
+function ago(seconds) {
+  if (seconds < 60) return "just now";
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`;
+  if (seconds < 86400) return `${Math.floor(seconds / 3600)}h ago`;
+  return `${Math.floor(seconds / 86400)}d ago`;
+}
+
 export default class Condoo extends View {
   init(_props, cx) {
     if (props()?.role === "answer-bar") return;
@@ -176,12 +190,13 @@ export default class Condoo extends View {
     this.cursorIndex = 0;    // its place, to land nearby when it disappears
     this.mode = "nav";       // nav | edit | confirm
     this.edit = null;        // { id | null, parent_id, kind, field }
-    this.filter = load("filter", null);       // a status, or null for all
-    this.showClosed = load("showClosed", false);
+    this.filter = load("filter", null);       // null: open items, a status, or "all"
+    if (!FILTERS.includes(this.filter)) this.filter = null;
     this.allSpaces = load("allSpaces", false);  // false: only the focused space's items
     this.folded = new Set(load("folded", []));   // l: task ids whose sub-tasks are folded away
     this.focusToken = null;
     this.expanded = null;    // task id whose description is open (space)
+    this.allComments = null; // task id whose earlier comments are shown too
     this.hovered = null;     // task id under the pointer: sub-tasks show in full then
     this.section = "task";   // the section the cursor is in: `a` adds there
     this.onEmpty = false;    // the cursor sits on an empty section (reached with [ ])
@@ -292,8 +307,9 @@ export default class Condoo extends View {
   }
 
   matches(t) {
+    if (this.filter === "all") return true;
     if (this.filter) return t.status === this.filter;
-    return this.showClosed || !CLOSED.has(t.status);
+    return !CLOSED.has(t.status);
   }
 
   // Flattened, ordered rows: section headers, then tasks depth-first by priority.
@@ -480,7 +496,7 @@ export default class Condoo extends View {
     else if (ch === "g") this.move(-1e9, cx);
     else if (ch === "G") this.move(1e9, cx);
     else if (ch === "f") {
-      this.filter = this.filter === null ? STATUSES[0] : (STATUSES[STATUSES.indexOf(this.filter) + 1] ?? null);
+      this.filter = next(FILTERS, this.filter, 1);
       save("filter", this.filter);
       this.reveal = true;
     } else if (ch === "l") {
@@ -498,10 +514,6 @@ export default class Condoo extends View {
     } else if (ch === "w") {
       this.allSpaces = !this.allSpaces;
       save("allSpaces", this.allSpaces);
-      this.reveal = true;
-    } else if (ch === "c") {
-      this.showClosed = !this.showClosed;
-      save("showClosed", this.showClosed);
       this.reveal = true;
     } else if (ch === "]" || ch === "[") {
       this.jumpSection(rows, ch === "]" ? 1 : -1, cx);
@@ -521,7 +533,10 @@ export default class Condoo extends View {
       handled = false;
     } else if (ch === " " || e.key === "space") {
       this.expanded = this.expanded === task.id ? null : task.id;
+      if (this.expanded) this.markSeen(task, cx);
       this.reveal = true;
+    } else if (ch === "c") {
+      this.comment(task, cx);
     } else if (ch === "e") {
       this.startEdit(task, null, cx);
     } else if (ch === ">") {
@@ -653,6 +668,8 @@ export default class Condoo extends View {
             .when(this.folded.has(task.id) && this.hasKids(task), (el) => el.child(div().flex_none().px(5).rounded(4)
               .bg(t.raised).text_size(10.5).text_color(t.muted)
               .child(`+${this.tasks.filter((x) => x.parent_id === task.id).length}`)))
+            .when(task.comments?.length > 0, (el) => el.child(svg("mods/condoo/megaphone.svg").size(13).flex_none()
+              .text_color(t.ansi3).opacity(unread(task) ? 1 : 0.4)))
             .when(full, (el) => el.child(div().flex_none().opacity(0.4).text_size(11).text_color(t.foreground).child(`${days}d`))))
           .when(full && Boolean(task.summary), (el) => el.child(
             div().text_size(TITLE_SIZE - 2).text_color(t.muted).child(task.summary)))
@@ -674,6 +691,7 @@ export default class Condoo extends View {
               .child(task.description
                 ? TextView.markdown(`desc-${task.id}`, task.description).selectable(true)
                 : div().text_color(t.dim).child("No description. Press e to add one."))))
+          .when(this.expanded === task.id, (el) => el.child(this.thread(t, task, now)))
           .when(confirming, (el) => el.child(
             div().pt(4).text_size(11.5).text_color(c.red).child(`Delete "${task.title}"${this.hasKids(task) ? " and its sub-tasks" : ""}? (y/n)`))));
     });
@@ -687,7 +705,8 @@ export default class Condoo extends View {
       if (idx >= 0) this.scroll.scroll_to_item(idx);
     }
 
-    const filterLabel = this.filter ? STATUS_LABEL[this.filter] : "All";
+    const filterLabel = this.filter === "all" ? "All" : this.filter ? STATUS_LABEL[this.filter] : "Open";
+    const filterColor = this.filter === "all" ? t.foreground : this.filter ? statusColor(this.filter) : t.dim;
 
     return v_flex().id("condoo-root").size_full().bg(t.chrome).text_color(t.foreground)
       .track_focus(this.h).on_key_down((e, cx) => this.key(e, cx))
@@ -700,9 +719,7 @@ export default class Condoo extends View {
             .text_color(this.allSpaces ? t.foreground : t.dim)
             .child(this.allSpaces ? "w: all spaces" : `w: this space${elsewhere ? ` (+${elsewhere})` : ""}`))
           .child(div().px(6).py(1).rounded(4).when(Boolean(this.filter), (el) => el.bg(t.raised))
-            .text_color(this.filter ? statusColor(this.filter) : t.dim).child(`f: ${filterLabel}`))
-          .child(div().px(6).py(1).rounded(4).text_color(t.dim)
-            .child(this.showClosed || this.filter ? "c: done shown" : "c: done hidden"))))
+            .text_color(filterColor).child(`f: ${filterLabel}`))))
       .when(Boolean(this.error), (el) => el.child(
         div().px(12).py(8).text_size(11.5).text_color(c.red).child(`Couldn't read Condoo: ${this.error}`)))
       .child(div().flex_1().min_h(0).relative()
@@ -724,50 +741,62 @@ export default class Condoo extends View {
     cx.notify();
   }
 
+  // $EDITOR in a dialog on a draft condoo wrote (`fileCmd ID` → {path, editor}); resolves with
+  // the draft's path once the editor exits. condoo picks the editor ($VISUAL, $EDITOR, else
+  // one it finds), so no shell is needed and Windows works too.
+  async editDraft(cx, fileCmd, task, bar) {
+    const { path, editor } = await cli([fileCmd, String(task.id)]);
+    const r = await hc(["run", "--json", "--bg", "--no-parent", "--cwd", home(), "--", ...editor, path]);
+    const addr = JSON.parse(r.stdout).address;
+    if (!addr) throw new Error(r.stderr.trim() || "couldn't start the editor");
+    const overlay = openOverlay({
+      kind: "dialog", modal: true, width: 0.6, height: 0.6,
+      layout: { type: "column", children: [
+        { type: "block", size: { px: 30 }, content: { mod: "condoo",
+          props: { role: "answer-bar", ...bar, title: task.title, terminal: addr, editor: editor[0] } } },
+        { type: "block", content: { terminal: addr } },
+      ] },
+    });
+    try {
+      await cx.sleep(150);
+      run("pane.focus", { terminal: addr });
+      for (;;) {
+        await cx.sleep(400);
+        const term = terminals().find((x) => x.address === addr);
+        if (!term || term.state !== "live") break;
+      }
+    } finally {
+      closeOverlay(overlay);
+    }
+    return path;
+  }
+
+  // Types a message into the item's agent if it's still running and idle. Returns
+  // "sent", "busy" (saved, not typed) or null (no agent to tell).
+  async tellAgent(task, msg) {
+    if (!task.terminal || !terminals().some((x) => x.address === task.terminal)) return null;
+    const sent = await hc(["send", "--if", "idle", task.terminal, msg]);
+    return sent.code === 0 ? "sent" : "busy";
+  }
+
   // Enter on a question: $EDITOR in a dialog; on exit store the answer and hand it to the agent.
   answer(task, cx) {
     if (this.answering) return;
     this.answering = task.id;
     cx.spawn(async (cx) => {
-      let overlay = null;
       try {
-        // condoo picks the editor ($VISUAL, $EDITOR, else one it finds), so no shell is
-        // needed and Windows works too.
-        const { path, editor } = await cli(["answer-file", String(task.id)]);
-        const r = await hc(["run", "--json", "--bg", "--no-parent", "--cwd", home(), "--", ...editor, path]);
-        const addr = JSON.parse(r.stdout).address;
-        if (!addr) throw new Error(r.stderr.trim() || "couldn't start the editor");
-        overlay = openOverlay({
-          kind: "dialog", modal: true, width: 0.6, height: 0.6,
-          layout: { type: "column", children: [
-            { type: "block", size: { px: 30 }, content: { mod: "condoo",
-              props: { role: "answer-bar", title: task.title, agent: task.agent, terminal: addr, editor: editor[0] } } },
-            { type: "block", content: { terminal: addr } },
-          ] },
-        });
-        await cx.sleep(150);
-        run("pane.focus", { terminal: addr });
-        for (;;) {
-          await cx.sleep(400);
-          const term = terminals().find((x) => x.address === addr);
-          if (!term || term.state !== "live") break;
-        }
-        closeOverlay(overlay);
-        overlay = null;
+        const path = await this.editDraft(cx, "answer-file", task, { label: "Answer", agent: task.agent && `for ${task.agent}` });
         const out = await cli(["answer-save", String(task.id), path]);
+        const who = task.agent || task.terminal;
         if (out.cancelled) {
           notify({ title: "No answer saved", body: task.title, level: "info", timeout: 3000 });
-        } else if (task.terminal && terminals().some((x) => x.address === task.terminal)) {
-          const msg = `Answer to your question (condoo #${task.id}) "${task.title}":\n\n${out.answer}`;
-          const sent = await hc(["send", "--if", "idle", task.terminal, msg]);
-          notify(sent.code === 0
-            ? { title: `Answer sent to ${task.agent || task.terminal}`, body: task.title, level: "success", timeout: 3000 }
-            : { title: "Answer saved, not sent", body: `${task.agent || task.terminal} is busy. It can read it with condoo get ${task.id}.`, level: "warning", timeout: 6000 });
         } else {
-          notify({ title: "Answer saved", body: task.title, level: "success", timeout: 3000 });
+          const told = await this.tellAgent(task, `Answer to your question (condoo #${task.id}) "${task.title}":\n\n${out.answer}`);
+          notify(told === "sent" ? { title: `Answer sent to ${who}`, body: task.title, level: "success", timeout: 3000 }
+            : told === "busy" ? { title: "Answer saved, not sent", body: `${who} is busy. It can read it with condoo get ${task.id}.`, level: "warning", timeout: 6000 }
+            : { title: "Answer saved", body: task.title, level: "success", timeout: 3000 });
         }
       } catch (e) {
-        if (overlay) closeOverlay(overlay);
         notify({ title: "Condoo: answering failed", body: String(e.message ?? e), level: "error", timeout: 6000 });
       }
       this.answering = null;
@@ -776,14 +805,74 @@ export default class Condoo extends View {
     });
   }
 
+  // c: a comment in $EDITOR, posted as the person and typed into the item's agent if it's idle.
+  comment(task, cx) {
+    if (this.answering) return;
+    this.answering = task.id;
+    cx.spawn(async (cx) => {
+      try {
+        const path = await this.editDraft(cx, "comment-file", task, { label: "Comment", agent: `on #${task.id}` });
+        const out = await cli(["comment-save", String(task.id), path]);
+        const who = task.agent || task.terminal;
+        if (out.cancelled) {
+          notify({ title: "No comment posted", body: task.title, level: "info", timeout: 3000 });
+        } else {
+          this.expanded = task.id;
+          const told = await this.tellAgent(task,
+            `Comment from ${out.author} on condoo #${task.id} "${task.title}":\n\n${out.body}`);
+          notify(told === "sent" ? { title: `Comment sent to ${who}`, body: task.title, level: "success", timeout: 3000 }
+            : told === "busy" ? { title: "Comment saved, not sent", body: `${who} is busy. It can read it with condoo get ${task.id}.`, level: "warning", timeout: 6000 }
+            : { title: "Comment saved", body: task.title, level: "success", timeout: 3000 });
+          await cli(["seen", String(task.id)]);
+        }
+      } catch (e) {
+        notify({ title: "Condoo: commenting failed", body: String(e.message ?? e), level: "error", timeout: 6000 });
+      }
+      this.answering = null;
+      this.h.focus();
+      this.reload(cx);
+    });
+  }
+
+  // Opening an item reads its comments.
+  markSeen(task, cx) {
+    if (!unread(task)) return;
+    task.seen_at = Date.now() / 1000;
+    this.mutate(cx, ["seen", String(task.id)]);
+  }
+
+  // The comments under an expanded item: the latest few, oldest first.
+  thread(t, task, now) {
+    const all = task.comments ?? [];
+    const hidden = this.allComments === task.id ? 0 : Math.max(0, all.length - SHOWN_COMMENTS);
+    const shown = all.slice(hidden);
+    const hint = div().text_size(11).text_color(t.dim).child(all.length ? "c comment" : "No comments. Press c to add one.");
+    if (!all.length) return v_flex().mt(8).child(hint);
+    return v_flex().mt(10).gap(8)
+      .child(div().text_size(10.5).font_semibold().text_color(t.dim).child("COMMENTS"))
+      .when(hidden > 0, (el) => el.child(div().id(`more-${task.id}`).text_size(11).text_color(t.accent)
+        .hover((s) => s.underline())
+        .on_click((_e, cx) => { this.allComments = task.id; cx.stop_propagation(); cx.notify(); })
+        .child(`show ${hidden} earlier`)))
+      .children(shown.map((c) => v_flex().gap(2)
+        .child(h_flex().gap(6).items_center().text_size(11)
+          .child(div().flex_none().text_color(c.by_agent ? t.muted : t.accent).child("●"))
+          .child(div().flex_1().min_w(0).truncate().font_medium()
+            .text_color(c.by_agent ? t.muted : t.accent).child(c.author || (c.by_agent ? "agent" : "you")))
+          .child(div().flex_none().text_color(t.dim).child(ago(Math.max(0, now - c.created_at)))))
+        .child(div().pl(14).text_size(TITLE_SIZE - 2).text_color(t.foreground)
+          .child(TextView.markdown(`c-${c.id}`, c.body).selectable(true)))))
+      .child(hint);
+  }
+
   answerBar() {
     const t = theme();
     const p = props();
     return h_flex().id("answer-bar").size_full().px(12).gap(10).items_center().bg(t.chrome)
       .border_b_1().border_color(t.border).text_size(12)
-      .child(div().flex_none().font_semibold().text_color(t.muted).child("Answer"))
+      .child(div().flex_none().font_semibold().text_color(t.muted).child(p.label ?? "Answer"))
       .child(div().flex_1().min_w(0).truncate().text_color(t.foreground).child(p.title ?? ""))
-      .when(Boolean(p.agent), (el) => el.child(div().flex_none().text_color(t.dim).child(`for ${p.agent}`)))
+      .when(Boolean(p.agent), (el) => el.child(div().flex_none().text_color(t.dim).child(p.agent)))
       .child(div().flex_none().text_color(t.dim).child(
         /(^|[\\/])n?vim?(\.exe)?$/i.test(p.editor ?? "") ? ":wq saves · :q! cancels" : "save and quit the editor to send"));
   }

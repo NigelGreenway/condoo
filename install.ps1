@@ -168,7 +168,7 @@ try {
         }
         New-Item -ItemType Directory -Force -Path $modDir | Out-Null
         # Only the mod's own files: Herdr's jsconfig.json / .d.ts and bin.json are left as they are.
-        Get-ChildItem $src -File | Where-Object { ($_.Extension -eq ".js" -and $_.Name -notlike "*.d.ts") -or $_.Name -eq "mod.json" } |
+        Get-ChildItem $src -File | Where-Object { ($_.Extension -eq ".js" -and $_.Name -notlike "*.d.ts") -or $_.Extension -eq ".svg" -or $_.Name -eq "mod.json" } |
             Copy-Item -Destination $modDir -Force
         @{ path = $exe } | ConvertTo-Json | Set-Content -Encoding utf8 (Join-Path $modDir "bin.json")
         if (Get-Command herdr-app -ErrorAction SilentlyContinue) { herdr-app check $modDir }

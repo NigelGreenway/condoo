@@ -44,6 +44,13 @@ condoo request "Approve the Linear reads" -s "The agent is paused on permission 
   -d "Run hc attach t2r and choose option 2 ..." --agent "<your name> (<task>)"
 ```
 
-Mark it done once it's resolved: `condoo set N --status completed`. Don't add, change or
+Mark it done once it's resolved: `condoo set N --status completed`.
+
+## Comments
+
+Add progress notes to an item rather than rewriting its description:
+`condoo comment N "Done for menu-service; venue-service waits on #19" --agent "<your name> (<task>)"`.
+Their comments reach you as `Comment from <name> on condoo #N "...": ...`; `condoo get N`
+lists every comment (`comments`, oldest first). Don't add, change or
 delete their own tasks (`kind: task`) unless they ask. `condoo list` prints everything as
 JSON; `condoo --help` lists every command.

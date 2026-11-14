@@ -14,13 +14,13 @@ The panel is one column on Herdr's `chrome` background, 340px wide as a sidebar 
 resizable) or a 420px × 85% dialog.
 
 - **Header bar** (36px, a 1px `border` line under it): "Condoo" at 13px semibold, in
-  `foreground` while the panel has the keyboard, `muted` otherwise. On the right are three 11px
+  `foreground` while the panel has the keyboard, `muted` otherwise. On the right are two 11px
   chips in `dim`, each on a `raised` background with 4px corners while its setting is
   non-default:
   - `w: this space (+3)`: the `+N` counts open items in other spaces. Toggled on, it reads
     `w: all spaces`.
-  - `f: All`, or the status being filtered on, in that status's colour.
-  - `c: done hidden` / `c: done shown`.
+  - `f: Open` (everything but completed and cancelled), the status being filtered on in that
+    status's colour, or `f: All`.
 - **Three sections**, always in this order:
   1. **Needs your reply**: agents' requests.
   2. **My tasks**: your own.
@@ -32,8 +32,10 @@ resizable) or a 420px × 85% dialog.
 - **Items** are rows with 6px corners and a 6px margin each side:
   - **Left edge:** a 3px stripe for priority: urgent `#e06c75`, high `#d19a66`, low `dim`,
     none for normal.
-  - **Line 1:** the title, 13px medium. On the right of the same line: the days since the
-    last status change ("3d", 11px at 40% opacity).
+  - **Line 1:** `#id` (11px `dim`), the title, 13px medium. On the right of the same line:
+    a 13px megaphone in `ansi3` when the item has comments (40% opacity once read, full when
+    an agent has commented since the person last opened it), then the days since the last
+    status change ("3d", 11px at 40% opacity).
   - **Line 2:** the summary, 11px `muted`.
   - **Answered questions** add "↪" and the answer's first line, 11px `dim`.
   - **Bottom line, 11px:** the status, then the person it's waiting on in yellow, pushed to
@@ -54,7 +56,12 @@ resizable) or a 420px × 85% dialog.
   otherwise. Rows that match no filter but have matching sub-items show at 45% opacity, for
   context.
 - **Space** opens the item's description under it: markdown in a `background` box with a 1px
-  `border`, selectable. "No description. Press e to add one." when empty.
+  `border`, selectable. "No description. Press e to add one." when empty. Under it,
+  "COMMENTS" (10.5px semibold `dim`) and the latest 5 comments, oldest first: a ● and the
+  author (the person's in `accent`, agents' in `muted`), "12m ago" on the right, and the
+  markdown body indented 14px. "show N earlier" (`accent`) reveals the rest; a `dim`
+  "c comment" line ends the thread ("No comments. Press c to add one." when there are none).
+  Opening an item marks its comments read (`condoo seen N`).
 - **Add and edit** use an inline form in a `surface` card with an `accent` border. It has
   four fields (Title, Summary, Description, Waiting on) on `background` inputs, each with a
   `accent` border while active. The description grows from 6 to 18 rows.
@@ -119,12 +126,17 @@ resizable) or a 420px × 85% dialog.
     - `m` opens the move picker for the item (from a sub-item, its top-level parent).
       `j`/`k` or click pick a space; Enter moves the item and all its sub-items there
       (`condoo move`), and the panel reloads. "Personal" removes the space.
+    - `c` comments: `condoo comment-file N` writes a draft (blank, a cut line, then the item
+      and its last 5 comments as `#` lines) and it opens in the same editor dialog as an
+      answer, its bar reading "Comment" and "on #N". `condoo comment-save N PATH` posts the
+      text above the cut as the person; empty cancels ("No comment posted"). If the item's
+      terminal is open and idle, `Comment from <name> on condoo #N "title":` and the text are
+      typed into it ("Comment sent to …"), else "Comment saved".
     - `x` asks `Delete "…"? (y/n)` in red. `y` deletes the item and its sub-items.
   - **View:**
     - `w`: this space / all spaces.
-    - `f`: cycle a status filter.
-    - `c`: show/hide completed and cancelled.
-    - `w`, `f`, `c` and folds are remembered per panel.
+    - `f`: cycle the filter: open → each status → all.
+    - `w`, `f` and folds are remembered per panel.
   - **Leaving:** `?` opens the help. `q` hides the panel. `esc` gives the keyboard back to the
     pane and keeps a sidebar open; a dialog it closes, like `q`.
 - **Answering:**
@@ -200,12 +212,18 @@ with exit code 1, or 2 for a misused command.
   - `add` (with `--space` and `--space-name`); `set-json ID '{…}'`; `delete ID`
   - `move ID --space ID --space-name NAME`: the item and its sub-items; `--space ""` for none
   - `answer-file ID` → `{path, editor: [argv]}`; `answer-save ID PATH`
-- **What agents call:** `ask`, `request`, `get`, `set`, `move`.
+  - `comment-file ID` → `{path, editor}`; `comment-save ID PATH`; `seen ID` (sets `seen_at`)
+- **What agents call:** `ask`, `request`, `get`, `set`, `move`, `comment ID TEXT --agent NAME`
+  (without `--agent` or `$CONDOO_AGENT`, the comment is the person's), `comments ID`.
+- **Every item** in `list` and `get` carries `comments` (oldest first) and `seen_at`.
 - **Table `tasks`:** `id`, `parent_id` (cascade delete), `kind` (request | task | question),
   `title`, `summary`, `description`, `status`, `priority`, `waiting_on`, `agent`, `terminal`,
-  `space`, `space_name` (the space's name when last seen), `answer`, and `created_at` /
+  `space`, `space_name` (the space's name when last seen), `answer`, `seen_at` (when the
+  person last opened it), and `created_at` /
   `updated_at` / `status_since` as float Unix seconds. A sub-item takes its parent's space and
   name. Older databases gain missing columns when opened.
+- **Table `comments`:** `id`, `task_id` (cascade delete), `author`, `by_agent` (0/1), `body`,
+  `created_at`. A comment doesn't change its item's `updated_at`.
 - **Settings:**
   - **Name:** `CONDOO_NAME` > `config.json` `name` > the login name, with `DOMAIN\`
     stripped.

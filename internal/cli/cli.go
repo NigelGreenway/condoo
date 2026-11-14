@@ -24,6 +24,9 @@ import (
 // Cut separates the answer from the question shown under it in the answer draft.
 const Cut = "# ---- write your answer above this line; save and quit to send it, an empty answer cancels ----"
 
+// CommentCut does the same for a comment draft.
+const CommentCut = "# ---- write your comment above this line; save and quit to post it, an empty comment cancels ----"
+
 const usage = `condoo: questions and requests from agents to you, and your own tasks.
 Shown in Herdr's Condoo panel; stored in SQLite. Every command prints JSON.
 
@@ -33,6 +36,7 @@ Agents:
   condoo request "Approve the Linear reads" -s "..." -d "..." --agent "Codex (t2r)"
   condoo get 12                      its status and answer
   condoo set 12 --status completed
+  condoo comment 12 "Done for menu-service" --agent "Claude (TICKET-123)"
 
 Commands:
   ask TITLE [options]        a question to answer in writing (kind question)
@@ -54,11 +58,15 @@ Commands:
   move ID --space ID [--space-name NAME]
                              the item and its sub-items to a Herdr space ("" for none)
   delete ID                  the item and its sub-items
+  comment ID TEXT [--agent NAME]
+                             a note on an item: by NAME (default $CONDOO_AGENT), else by you
+  comments ID                an item's comments, oldest first (get includes them too)
   config                     your name, the database, and where each came from
   config set name|db VALUE   save to config.json ("" goes back to the default)
   version
 
-Used by the panel: set-json ID JSON, answer-file ID, answer-save ID PATH.
+Used by the panel: set-json ID JSON, answer-file ID, answer-save ID PATH, comment-file ID,
+comment-save ID PATH, seen ID.
 
 Environment: CONDOO_NAME, CONDOO_DB, CONDOO_CONFIG override config.json; CONDOO_AGENT,
 HC_TERMINAL_ID fill --agent and --terminal.
@@ -179,9 +187,11 @@ func run(args []string, d Deps) (any, error) {
 		flags, npos = setFlags, 1
 	case "move":
 		flags, npos = moveFlags, 1
-	case "set-json", "answer-save":
+	case "comment":
+		flags, npos = []flag{{key: "agent", names: []string{"--agent"}}}, 2
+	case "set-json", "answer-save", "comment-save":
 		npos = 2
-	case "get", "delete", "answer-file":
+	case "get", "delete", "answer-file", "comments", "comment-file", "seen":
 		npos = 1
 	default:
 		return nil, bad("unknown command %q (condoo --help)", cmd)
@@ -257,6 +267,21 @@ func run(args []string, d Deps) (any, error) {
 		return answerFile(st, id, d)
 	case "answer-save":
 		return answerSave(st, id, pos[1])
+	case "comment":
+		author, byAgent := commentAuthor(opts, cfg, d)
+		return st.AddComment(id, author, byAgent, pos[1])
+	case "comments":
+		t, err := st.Get(id)
+		if err != nil {
+			return nil, err
+		}
+		return t.Comments, nil
+	case "comment-file":
+		return commentFile(st, id, d)
+	case "comment-save":
+		return commentSave(st, id, pos[1], cfg)
+	case "seen":
+		return st.Seen(id)
 	}
 	return nil, bad("unknown command %q", cmd)
 }
@@ -531,4 +556,62 @@ func SpaceIn(lsJSON []byte, terminal string) (string, string) {
 		}
 	}
 	return "", ""
+}
+
+// commentAuthor: an agent's name from --agent or $CONDOO_AGENT, else the person's own name.
+func commentAuthor(opts map[string]string, cfg config.Resolved, d Deps) (string, bool) {
+	agent, ok := opts["agent"]
+	if !ok {
+		agent = d.Sys.Env("CONDOO_AGENT")
+	}
+	if agent = strings.TrimSpace(agent); agent != "" {
+		return agent, true
+	}
+	return cfg.Name, false
+}
+
+// commentFile writes a draft to comment in: an empty space, then the item and its last few
+// comments as comment lines below the cut. It also says which editor to open it with.
+func commentFile(st *store.Store, id int64, d Deps) (any, error) {
+	t, err := st.Get(id)
+	if err != nil {
+		return nil, err
+	}
+	dir := config.AnswerDir(d.Sys)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return nil, err
+	}
+	path := filepath.Join(dir, fmt.Sprintf("comment-%d.md", id))
+	lines := []string{CommentCut, "#", fmt.Sprintf("# Comment on #%d: %s", t.ID, t.Title)}
+	if t.Summary != "" {
+		lines = append(lines, "# "+t.Summary)
+	}
+	recent := t.Comments
+	if len(recent) > 5 {
+		recent = recent[len(recent)-5:]
+	}
+	for _, c := range recent {
+		lines = append(lines, "#", "# "+c.Author+":")
+		for _, l := range strings.Split(c.Body, "\n") {
+			lines = append(lines, "#   "+l)
+		}
+	}
+	if err := os.WriteFile(path, []byte("\n\n"+strings.Join(lines, "\n")+"\n"), 0o600); err != nil {
+		return nil, err
+	}
+	return map[string]any{"path": path, "editor": Editor(d)}, nil
+}
+
+// commentSave posts the draft as the person's comment and removes it.
+func commentSave(st *store.Store, id int64, path string, cfg config.Resolved) (any, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	os.Remove(path)
+	text, _, _ := strings.Cut(strings.ReplaceAll(string(b), "\r\n", "\n"), CommentCut)
+	if text = strings.TrimSpace(text); text == "" {
+		return map[string]bool{"cancelled": true}, nil
+	}
+	return st.AddComment(id, cfg.Name, false, text)
 }
