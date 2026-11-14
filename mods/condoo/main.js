@@ -646,6 +646,7 @@ export default class Condoo extends View {
         .child(v_flex().flex_1().min_w(0).pl(8 + r.depth * 14).pr(10).py(full ? 6 : 3).gap(2)
           .child(h_flex().gap(8).items_center()
             .when(r.depth > 0, (el) => el.child(div().text_color(t.dim).text_size(11).child("↳")))
+            .child(div().flex_none().text_size(11).text_color(t.dim).child(`#${task.id}`))
             .child(div().flex_1().min_w(0).truncate().text_size(TITLE_SIZE).font_medium()
               .text_color(t.foreground).when(task.status === "cancelled", (el) => el.line_through())
               .child(task.title || "(untitled)"))
