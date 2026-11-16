@@ -189,16 +189,24 @@ func TestMigratesOldDatabase(t *testing.T) {
 		t.Fatal(err)
 	}
 	if old.Title != "old one" || old.Summary != "" || old.Answer != nil || old.Space != nil || old.SpaceName != nil ||
-		old.SeenAt != nil || old.Comments == nil || len(old.Comments) != 0 {
+		old.SeenAt == nil || *old.SeenAt != 1 || old.Comments == nil || len(old.Comments) != 0 {
 		t.Errorf("migrated row: %+v", old)
 	}
 	if _, err := s.Update(1, map[string]any{"answer": "yes", "space": "s1", "space_name": "core", "summary": "sum"}); err != nil {
+		t.Fatal(err)
+	}
+	// Items added after the upgrade start unseen, and reopening doesn't mark them seen.
+	added, err := s.Add(NewTask{Kind: "question", Title: "new one", Agent: str("Claude")})
+	if err != nil {
 		t.Fatal(err)
 	}
 	// Reopening an up-to-date database changes nothing.
 	s.Close()
 	if s, err = Open(path); err != nil {
 		t.Fatal(err)
+	}
+	if got, err := s.Get(added.ID); err != nil || got.SeenAt != nil {
+		t.Errorf("item added after the upgrade: %+v, %v", got, err)
 	}
 }
 
