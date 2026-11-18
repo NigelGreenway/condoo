@@ -166,6 +166,10 @@ func migrate(db *sql.DB) error {
 		}
 		have[name] = true
 	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
 	rows.Close()
 	for _, add := range []struct{ col, ddl string }{
 		{"answer", "ALTER TABLE tasks ADD COLUMN answer TEXT"},
