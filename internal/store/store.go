@@ -197,6 +197,34 @@ func migrate(db *sql.DB) error {
 	return nil
 }
 
+// migrations[i] takes the database from schema version i to i+1. Append new steps; never
+// edit or reorder old ones, and write each against the schema the step before it left.
+var migrations = []func(tx *sql.Tx) error{
+	// 1: items nobody has opened show as new. Everything from before then counts as seen,
+	// so upgrading lights nothing up. Their unread comments stay unread.
+	func(tx *sql.Tx) error {
+		_, err := tx.Exec("UPDATE tasks SET seen_at = created_at WHERE seen_at IS NULL")
+		return err
+	},
+}
+
+// runMigration applies one step and records its version in one transaction, so a failed
+// step leaves the database at the version before it and runs again on the next start.
+func runMigration(db *sql.DB, version int, step func(tx *sql.Tx) error) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := step(tx); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(fmt.Sprintf("PRAGMA user_version = %d", version)); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 func (s *Store) Close() error { return s.db.Close() }
 
 func (s *Store) now() float64 { return float64(s.Now().UnixNano()) / 1e9 }
