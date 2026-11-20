@@ -1,5 +1,5 @@
-// Condoo (Context + Todo): a sidebar of (1) things agents need you to reply to, (2) your own
-// tasks and (3) agents' questions, stored in SQLite through the `condoo` command. Vim-style
+// Condoo (Context + Todo): a sidebar with three tabs: (1) things agents need you to reply to,
+// (2) your own tasks and (3) agents' questions, stored in SQLite through the `condoo` command. Vim-style
 // keys (see key()).
 //
 // One mod, several roles:
@@ -36,10 +36,11 @@ const STATUS_LABEL = {
 const CLOSED = new Set(["completed", "cancelled"]);
 const PRIORITIES = ["urgent", "high", "normal", "low"];
 const PRIORITY_LABEL = { urgent: "Urgent", high: "High", normal: "Normal", low: "Low" };
+// The tabs, one list each; [ and ] move between them.
 const SECTIONS = [
-  { kind: "request", label: "Needs your reply", empty: "Nothing waiting on you" },
-  { kind: "task", label: "My tasks", empty: "No tasks. Press a to add one" },
-  { kind: "question", label: "Questions", empty: "No open questions" },
+  { kind: "request", tab: "Replies", empty: "Nothing waiting on you" },
+  { kind: "task", tab: "Tasks", empty: "No tasks. Press a to add one" },
+  { kind: "question", tab: "Questions", empty: "No open questions" },
 ];
 const FIELDS = ["title", "summary", "description", "waiting_on"];
 const FIELD_LABEL = { title: "Title", summary: "Summary", description: "Description", waiting_on: "Waiting on" };
@@ -53,15 +54,15 @@ const PATH_LABEL = "condoo.path";   // on an editor terminal: the draft file
 
 // The `?` dialog: [title, intro, [[keys, what], ...]]
 const HELP = [
-  ["The panel", "Three sections. Items belong to the space they were raised in, and follow it if it's closed and opened again with the same name. Items with no space sit under Personal tasks, and items whose space is closed under Detached Spaces; both show in every space.", [
-    ["Needs your reply", "requests from agents: something to do or reply to"],
-    ["My tasks", "your own tasks and sub-tasks"],
+  ["The panel", "Three tabs. A grey dot means the tab has open items in this space; a yellow one means something in it is new (an agent's item you haven't opened, or a comment you haven't read) in any space. Opening an item with space reads it. Items belong to the space they were raised in, and follow it if it's closed and opened again with the same name. Items with no space sit under Personal tasks, and items whose space is closed under Detached Spaces; both show in every space.", [
+    ["Replies", "requests from agents: something to do or reply to"],
+    ["Tasks", "your own tasks and sub-tasks"],
     ["Questions", "agents' questions to answer in writing"],
   ]],
   ["Moving", null, [
     ["j k  ↓ ↑", "next / previous item"],
     ["g G", "first / last item"],
-    ["[ ]", "previous / next section (empty ones too)"],
+    ["[ ]", "previous / next tab"],
     ["space", "show / hide the description and comments"],
     ["l", "fold / unfold this item's sub-tasks"],
   ]],
@@ -166,6 +167,10 @@ const next = (list, v, step = 1) => list[(list.indexOf(v) + step + list.length) 
 // An agent commented since the person last opened the item (their own comments never count).
 const unread = (task) => (task.comments ?? []).some((c) => c.by_agent && c.created_at > (task.seen_at ?? 0));
 
+// New to the person: an agent's request or question they haven't opened yet, or unread
+// comments on anything. Their own tasks, and items they add in the panel (no agent), never are.
+const isNew = (task) => unread(task) || (task.kind !== "task" && Boolean(task.agent) && task.seen_at == null);
+
 // "just now", "12m ago", "3h ago", "2d ago".
 function ago(seconds) {
   if (seconds < 60) return "just now";
@@ -200,8 +205,9 @@ export default class Condoo extends View {
     this.expanded = null;    // task id whose description is open (space)
     this.allComments = null; // task id whose earlier comments are shown too
     this.hovered = null;     // task id under the pointer: sub-tasks show in full then
-    this.section = "task";   // the section the cursor is in: `a` adds there
-    this.onEmpty = false;    // the cursor sits on an empty section (reached with [ ])
+    this.section = load("section", SECTIONS[0].kind); // the tab shown: `a` adds there
+    if (!SECTIONS.some((s) => s.kind === this.section)) this.section = SECTIONS[0].kind;
+    this.onEmpty = false;    // the tab shown is empty
 
     this.h = cx.focus_handle();
     this.scroll = ScrollHandle.new();
@@ -318,7 +324,7 @@ export default class Condoo extends View {
     return !CLOSED.has(t.status);
   }
 
-  // Flattened, ordered rows: section headers, then tasks depth-first by priority.
+  // The shown tab's rows, flattened: tasks depth-first by priority.
   rows() {
     this.idx = spaceIndex();
     const byParent = new Map();
@@ -337,8 +343,7 @@ export default class Condoo extends View {
       return v;
     };
     const out = [];
-    for (const s of SECTIONS) {
-      out.push({ header: s });
+    for (const s of SECTIONS.filter((x) => x.kind === this.section)) {
       let any = false;
       const walk = (list, depth) => {
         for (const t of [...list].sort(order)) {
@@ -395,18 +400,6 @@ export default class Condoo extends View {
   move(step, cx) {
     const items = this.selectable(this.rows());
     if (!items.length) return;
-    if (this.onEmpty) {
-      // Off an empty section: the nearest item in the direction of travel.
-      const at = (k) => SECTIONS.findIndex((s) => s.kind === k);
-      const here = at(this.section);
-      const t = step > 0
-        ? items.find((x) => at(x.kind) > here)
-        : [...items].reverse().find((x) => at(x.kind) < here);
-      if (t) { this.onEmpty = false; this.cursor = t.id; this.cursorIndex = items.indexOf(t); this.section = t.kind; }
-      this.reveal = true;
-      cx.notify();
-      return;
-    }
     let i = items.findIndex((t) => t.id === this.cursor);
     i = i < 0 ? 0 : Math.max(0, Math.min(items.length - 1, i + step));
     this.cursor = items[i].id;
@@ -456,7 +449,7 @@ export default class Condoo extends View {
           if (here) args.push(`--space-name=${spaces().find((sp) => sp.id === here)?.name ?? ""}`);
         }
         args.push("--", v.title);
-        this.mutate(cx, args, (t) => { this.cursor = t.id; this.onEmpty = false; this.section = t.kind; this.reveal = true; });
+        this.mutate(cx, args, (t) => { this.showTab(t.kind); this.cursor = t.id; this.onEmpty = false; });
       }
     } else {
       const task = this.tasks.find((t) => t.id === e.id);
@@ -615,14 +608,6 @@ export default class Condoo extends View {
     const elsewhere = this.allSpaces ? 0 : this.tasks.filter((x) => open(x) && !this.inScope(x, idx)).length;
 
     const children = rows.map((r, i) => {
-      if (r.header) {
-        const n = this.tasks.filter((x) => x.kind === r.header.kind && open(x) && this.inScope(x, idx)).length;
-        const here = this.mode !== "edit" && this.section === r.header.kind;
-        return h_flex().id(`h-${r.header.kind}`).px(12).pt(i === 0 ? 8 : 16).pb(6).gap(6).items_center()
-          .text_size(10.5).font_semibold().text_color(here ? t.muted : t.dim)
-          .child(div().child(r.header.label.toUpperCase()))
-          .child(div().text_color(t.muted).child(n ? String(n) : ""));
-      }
       if (r.divider) {
         return h_flex().id(`d-${r.divider}`).mx(12).mt(6).mb(4).gap(8).items_center()
           .child(div().flex_1().h(1).bg(t.border))
@@ -668,6 +653,7 @@ export default class Condoo extends View {
         .child(v_flex().flex_1().min_w(0).pl(8 + r.depth * 14).pr(10).py(full ? 6 : 3).gap(2)
           .child(h_flex().gap(8).items_center()
             .when(r.depth > 0, (el) => el.child(div().text_color(t.dim).text_size(11).child("↳")))
+            .when(isNew(task) && !unread(task), (el) => el.child(div().flex_none().size(6).rounded(3).bg(c.yellow)))
             .child(div().flex_none().text_size(11).text_color(t.dim).child(`#${task.id}`))
             .child(div().flex_1().min_w(0).truncate().text_size(TITLE_SIZE).font_medium()
               .text_color(t.foreground).when(task.status === "cancelled", (el) => el.line_through())
@@ -730,25 +716,53 @@ export default class Condoo extends View {
             .child(this.allSpaces ? "w: all spaces" : `w: this space${elsewhere ? ` (+${elsewhere})` : ""}`))
           .child(div().px(6).py(1).rounded(4).when(Boolean(this.filter), (el) => el.bg(t.raised))
             .text_color(filterColor).child(`f: ${filterLabel}`))))
+      .child(this.tabs(t, c, open, idx))
       .when(Boolean(this.error), (el) => el.child(
         div().px(12).py(8).text_size(11.5).text_color(c.red).child(`Couldn't read Condoo: ${this.error}`)))
       .child(div().flex_1().min_h(0).relative()
-        .child(v_flex().id("condoo-list").size_full().overflow_y_scrollbar().track_scroll(this.scroll).pb(8)
+        .child(v_flex().id("condoo-list").size_full().overflow_y_scrollbar().track_scroll(this.scroll).pt(6).pb(8)
           .children(this.loaded ? children : [div().p(12).text_size(11.5).text_color(t.dim).child("Loading…")])));
   }
 
-  // [ and ]: the first item of the previous/next section that has any (wrapping round).
-  // Empty sections count too, so `a` can add to them.
-  jumpSection(rows, step, cx) {
-    const items = this.selectable(rows);
-    const kind = next(SECTIONS.map((s) => s.kind), this.section, step);
-    const first = items.find((t) => t.kind === kind);
-    this.section = kind;
-    this.onEmpty = !first;
-    this.cursor = first ? first.id : null;
-    if (first) this.cursorIndex = items.indexOf(first);
+  // The tab strip. Each tab: a dot (yellow: something new in it, in any space; grey: open
+  // items in scope; none: empty), its name and how many open items it has in scope.
+  tabs(t, c, open, idx) {
+    return h_flex().flex_none().px(8).gap(2).items_end().border_b_1().border_color(t.border)
+      .children(SECTIONS.map((s) => {
+        const n = this.tasks.filter((x) => x.kind === s.kind && open(x) && this.inScope(x, idx)).length;
+        const fresh = this.tasks.some((x) => x.kind === s.kind && !CLOSED.has(x.status) && isNew(x));
+        const on = this.section === s.kind;
+        return h_flex().id(`tab-${s.kind}`).px(8).pt(8).pb(7).gap(6).items_center().text_size(12)
+          .border_b_2().border_color(on ? t.accent : "#00000000")
+          .text_color(on ? t.foreground : t.muted)
+          .when(on, (el) => el.font_medium())
+          .hover((st) => st.text_color(t.foreground))
+          .on_mouse_down("left", () => { if (this.mode !== "edit") this.h.focus(); })
+          .on_click((_e, cx) => { if (this.mode !== "edit") this.showTab(s.kind, cx); })
+          .when(fresh || n > 0, (el) => el.child(div().flex_none().size(6).rounded(3).bg(fresh ? c.yellow : t.dim)))
+          .child(div().child(s.tab))
+          .when(n > 0, (el) => el.child(div().text_size(11).text_color(t.dim).child(String(n))));
+      }));
+  }
+
+  // Show a tab (remembered), with the cursor on its first item.
+  showTab(kind, cx) {
+    if (kind !== this.section) {
+      this.section = kind;
+      save("section", kind);
+      this.cursor = null;
+      this.cursorIndex = 0;
+      this.expanded = null;
+      if (this.mode === "confirm") this.mode = "nav";
+    }
+    this.onEmpty = !this.selectable(this.rows()).length;
     this.reveal = true;
-    cx.notify();
+    cx?.notify();
+  }
+
+  // [ and ]: the previous/next tab, wrapping round.
+  jumpSection(_rows, step, cx) {
+    this.showTab(next(SECTIONS.map((s) => s.kind), this.section, step), cx);
   }
 
   // ---------- drafts: $EDITOR on an answer or comment ----------
@@ -889,7 +903,7 @@ export default class Condoo extends View {
 
   // Opening an item reads its comments.
   markSeen(task, cx) {
-    if (!unread(task)) return;
+    if (!isNew(task)) return;
     task.seen_at = Date.now() / 1000;
     this.mutate(cx, ["seen", String(task.id)]);
   }

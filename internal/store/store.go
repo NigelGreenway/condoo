@@ -180,6 +180,20 @@ func migrate(db *sql.DB) error {
 			}
 		}
 	}
+	var version int
+	if err := db.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
+		return err
+	}
+	if version < 1 {
+		// Version 1 shows items nobody has opened as new. Everything from before then counts
+		// as seen, so upgrading lights nothing up. Their unread comments stay unread.
+		if _, err := db.Exec("UPDATE tasks SET seen_at = created_at WHERE seen_at IS NULL"); err != nil {
+			return err
+		}
+		if _, err := db.Exec("PRAGMA user_version = 1"); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 

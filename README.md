@@ -53,8 +53,12 @@ instead of downloading. `--help` lists the options, including `--yes` for no que
 
 ## Using the panel
 
-Three sections: **Needs your reply** (agents' requests), **My tasks** and **Questions**. Items
-belong to the Herdr space they were raised in; `w` switches between this space and all.
+Three tabs: **Replies** (agents' requests), **Tasks** (your own) and **Questions**; `[` and `]`
+move between them. Each tab shows how many open items it has, after a dot: grey when it has
+open items, yellow when something in it is new (an agent's item you haven't opened yet, or a
+comment you haven't read). New items carry the yellow dot too, until you open them with `space`.
+Items belong to the Herdr space they were raised in; `w` switches between this space and all.
+The yellow dot counts new items in every space, so you never miss one raised elsewhere.
 
 Closing a space never hides its items. They move under **Detached Spaces**, shown in every
 space and tagged with the old name. Open a space with the same name again (most spaces are
@@ -64,6 +68,7 @@ to any space, or to Personal.
 | Key | Does |
 |---|---|
 | `j` `k` | move |
+| `[` `]` | previous / next tab |
 | `enter` | answer a question in your editor, go to a request's agent, or edit a task |
 | `a` | add an item; `>` adds a sub-task |
 | `space` | show the description and comments |

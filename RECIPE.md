@@ -21,18 +21,29 @@ resizable) or a 420px × 85% dialog.
     `w: all spaces`.
   - `f: Open` (everything but completed and cancelled), the status being filtered on in that
     status's colour, or `f: All`.
-- **Three sections**, always in this order:
-  1. **Needs your reply**: agents' requests.
-  2. **My tasks**: your own.
+- **Three tabs** under the header, always in this order, with a 1px `border` line under the
+  strip; only the shown tab's list is drawn:
+  1. **Replies**: agents' requests.
+  2. **Tasks**: your own.
   3. **Questions**: agents' questions to answer in writing.
 
-  Each has a 10.5px semibold uppercase heading (`dim`, or `muted` for the section the cursor
-  is in) followed by its count of open items. An empty section shows one 11.5px `dim` line:
-  "Nothing waiting on you", "No tasks. Press a to add one" or "No open questions".
+  Each tab is 12px text (`foreground` and medium for the shown tab, with a 2px `accent` line
+  under it; `muted` otherwise), led by a 6px round dot and followed by its count of open
+  top-level items in scope (11px `dim`, hidden at 0). The dot is yellow (`#e5c07b`, light
+  `#9a7212`) when any open item of that kind, in any space, is **new**; `dim` when the tab has
+  open items in scope; absent otherwise. Clicking a tab shows it; the shown tab is remembered.
+  An empty tab shows one 11.5px `dim` line: "Nothing waiting on you", "No tasks. Press a to
+  add one" or "No open questions".
+- **New** means an agent commented since the person last opened the item, or the item is a
+  request or question with an agent that has never been opened (`seen_at` is null). Tasks
+  and items added in the panel (no agent) are never new by themselves. Opening an item with
+  `space` runs `condoo seen` and clears it. The database's first upgrade to this (SQLite
+  `user_version` 1) sets `seen_at = created_at` on every existing item, so nothing lights up.
 - **Items** are rows with 6px corners and a 6px margin each side:
   - **Left edge:** a 3px stripe for priority: urgent `#e06c75`, high `#d19a66`, low `dim`,
     none for normal.
-  - **Line 1:** `#id` (11px `dim`), the title, 13px medium. On the right of the same line:
+  - **Line 1:** a 6px yellow dot when the item is new without unread comments, `#id` (11px
+    `dim`), the title, 13px medium. On the right of the same line:
     a 13px megaphone in `ansi3` when the item has comments (40% opacity once read, full when
     an agent has commented since the person last opened it), then the days since the last
     status change ("3d", 11px at 40% opacity).
@@ -48,7 +59,7 @@ resizable) or a 420px × 85% dialog.
     name in a small `raised` chip.
 - **Sub-items** are indented 14px per level with "↳". They show only their title until
   hovered, selected or opened. A folded parent shows a `+N` chip.
-- **Personal tasks and Detached Spaces:** in each section, below the current space's items,
+- **Personal tasks and Detached Spaces:** in each tab, below the current space's items,
   thin dividers ("Personal tasks", then "Detached Spaces", 10px `dim` text between 1px
   `border` lines) group the items that show in every space. Personal tasks have no space.
   Detached items belonged to a space that's now closed and carry a `was: condoo` chip.
@@ -108,7 +119,7 @@ resizable) or a 420px × 85% dialog.
 - **Keys** (the panel must have the keyboard):
   - **Moving:**
     - `j`/`k` or the arrow keys move; `g`/`G` go to the first/last item.
-    - `[`/`]` jump to the previous/next section, landing on empty ones too.
+    - `[`/`]` show the previous/next tab (wrapping round), with the cursor on its first item.
     - `space` opens or closes the description; `l` folds or unfolds an item's sub-items.
   - **Enter:**
     - On a question: the answer flow (next bullet).
@@ -289,14 +300,15 @@ with exit code 1, or 2 for a misused command.
   `status: "discussion"` and `waiting_on` set to your name. Run inside Herdr, the item also has
   the terminal's `space`.
 - With the toggle key bound and no `condoo` block in the layout, the key opens a 420px dialog
-  listing the item under Questions with its summary. A second press refocuses it; `q` or Esc closes it.
+  listing the item under the Questions tab with its summary; the tab's dot is yellow until
+  `space` opens the item, then grey. A second press refocuses it; `q` or Esc closes it.
 - After an agent adds a block showing `condoo` with any id, the key shows and focuses that
   block (and its hidden column), never hides it, and the dialog no longer opens.
 - On the question, Enter opens the answer dialog with your editor. Write a line, save and
   quit: the question turns Completed in green, shows "↪" and your line, and the asking
   terminal receives `Answer to your question (condoo #N) "Test?":` followed by the answer.
 - Quitting the editor without writing anything saves nothing and shows "No answer saved".
-- `a`, then a title and Esc, adds a task under My tasks. `s` moves its status on and its age
+- `a`, then a title and Esc, adds a task under the Tasks tab. `s` moves its status on and its age
   resets to "0d". `x` then `y` deletes it with its sub-tasks.
 - `w` toggles to the all-spaces view, showing items from other spaces with a space chip.
 - Add a question from a terminal in a space called `condoo`, then close that space. In any
