@@ -183,7 +183,6 @@ func TestMigratesOldDatabase(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s.Close()
 	old, err := s.Get(1)
 	if err != nil {
 		t.Fatal(err)
@@ -202,10 +201,12 @@ func TestMigratesOldDatabase(t *testing.T) {
 	}
 	// Reopening an up-to-date database changes nothing.
 	s.Close()
-	if s, err = Open(path); err != nil {
+	reopened, err := Open(path)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if got, err := s.Get(added.ID); err != nil || got.SeenAt != nil {
+	defer reopened.Close()
+	if got, err := reopened.Get(added.ID); err != nil || got.SeenAt != nil {
 		t.Errorf("item added after the upgrade: %+v, %v", got, err)
 	}
 }
