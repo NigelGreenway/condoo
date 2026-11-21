@@ -424,6 +424,31 @@ func TestFailedMigrationRollsBack(t *testing.T) {
 	}
 }
 
+// A migration that fails after its version is written leaves the version as it was: the
+// version write is part of the step's transaction. The step itself succeeds; a deferred
+// foreign key it breaks fails the commit, after the version write.
+func TestFailedCommitKeepsVersion(t *testing.T) {
+	s := open(t)
+	step := func(tx *sql.Tx) error {
+		if _, err := tx.Exec("PRAGMA defer_foreign_keys = ON"); err != nil {
+			return err
+		}
+		_, err := tx.Exec("INSERT INTO comments (task_id, created_at) VALUES (999, 1)")
+		return err
+	}
+	if err := runMigration(s.db, len(migrations)+1, step); err == nil {
+		t.Fatal("a commit breaking a foreign key reported success")
+	}
+	var version int
+	if err := s.db.QueryRow("PRAGMA user_version").Scan(&version); err != nil || version != len(migrations) {
+		t.Errorf("version after a failed commit: %d, %v", version, err)
+	}
+	var comments int
+	if err := s.db.QueryRow("SELECT count(*) FROM comments").Scan(&comments); err != nil || comments != 0 {
+		t.Errorf("a failed commit's row was kept: %d, %v", comments, err)
+	}
+}
+
 func TestRefusesQuestionMarkInPath(t *testing.T) {
 	if _, err := Open(filepath.Join(t.TempDir(), "what?.sqlite")); err == nil {
 		t.Error("accepted a path with ?")
