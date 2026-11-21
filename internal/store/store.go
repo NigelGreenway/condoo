@@ -77,6 +77,10 @@ type NewTask struct {
 	SpaceName   *string
 }
 
+// ErrNewerSchema: the database was written by a newer condoo, at a schema version this one
+// doesn't know.
+var ErrNewerSchema = errors.New("database is from a newer condoo")
+
 // ErrNotFound: no item with that id.
 type ErrNotFound struct{ ID int64 }
 
@@ -113,7 +117,7 @@ func Open(path string) (*Store, error) {
 	}
 	if version > len(migrations) {
 		db.Close()
-		return nil, fmt.Errorf("%s: database is at schema version %d, but this condoo knows up to %d: upgrade condoo", path, version, len(migrations))
+		return nil, fmt.Errorf("%s: %w: it is at schema version %d, but this condoo knows up to %d: upgrade condoo", path, ErrNewerSchema, version, len(migrations))
 	}
 	for v := version; v < len(migrations); v++ {
 		if err := runMigration(db, v+1, migrations[v]); err != nil {
