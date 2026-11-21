@@ -96,7 +96,7 @@ type Store struct {
 // running the migrations the database hasn't had.
 func Open(path string) (*Store, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("create the database folder: %w", err)
 	}
 	// Pragmas in the DSN apply to every pooled connection (foreign keys are per connection).
 	// A plain path (not a file: URI), so spaces (macOS "Application Support") and Windows
@@ -106,14 +106,14 @@ func Open(path string) (*Store, error) {
 	}
 	db, err := sql.Open("sqlite", path+"?_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)")
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%s: open: %w", path, err)
 	}
 	db.SetMaxOpenConns(1)
 	// A newer condoo's database is refused before anything here touches its schema.
 	var version int
 	if err := db.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
 		db.Close()
-		return nil, fmt.Errorf("%s: %w", path, err)
+		return nil, fmt.Errorf("%s: read the schema version: %w", path, err)
 	}
 	if version > len(migrations) {
 		db.Close()
@@ -172,11 +172,11 @@ var migrations = []func(tx *sql.Tx) error{
 	// comments stay unread.
 	func(tx *sql.Tx) error {
 		if _, err := tx.Exec(schemaV1); err != nil {
-			return err
+			return fmt.Errorf("create the tables: %w", err)
 		}
 		rows, err := tx.Query("PRAGMA table_info(tasks)")
 		if err != nil {
-			return err
+			return fmt.Errorf("read the tasks columns: %w", err)
 		}
 		have := map[string]bool{}
 		for rows.Next() {
@@ -187,13 +187,13 @@ var migrations = []func(tx *sql.Tx) error{
 			)
 			if err := rows.Scan(&cid, &name, &typ, &notnull, &dflt, &pk); err != nil {
 				rows.Close()
-				return err
+				return fmt.Errorf("scan a tasks column: %w", err)
 			}
 			have[name] = true
 		}
 		if err := rows.Err(); err != nil {
 			rows.Close()
-			return err
+			return fmt.Errorf("read the tasks columns: %w", err)
 		}
 		rows.Close()
 		for _, add := range []struct{ col, ddl string }{
@@ -205,12 +205,14 @@ var migrations = []func(tx *sql.Tx) error{
 		} {
 			if !have[add.col] {
 				if _, err := tx.Exec(add.ddl); err != nil {
-					return err
+					return fmt.Errorf("add column tasks.%s: %w", add.col, err)
 				}
 			}
 		}
-		_, err = tx.Exec("UPDATE tasks SET seen_at = created_at WHERE seen_at IS NULL")
-		return err
+		if _, err := tx.Exec("UPDATE tasks SET seen_at = created_at WHERE seen_at IS NULL"); err != nil {
+			return fmt.Errorf("mark existing items seen: %w", err)
+		}
+		return nil
 	},
 }
 
@@ -219,16 +221,19 @@ var migrations = []func(tx *sql.Tx) error{
 func runMigration(db *sql.DB, version int, step func(tx *sql.Tx) error) error {
 	tx, err := db.Begin()
 	if err != nil {
-		return err
+		return fmt.Errorf("begin: %w", err)
 	}
 	defer tx.Rollback()
 	if err := step(tx); err != nil {
 		return err
 	}
 	if _, err := tx.Exec(fmt.Sprintf("PRAGMA user_version = %d", version)); err != nil {
-		return err
+		return fmt.Errorf("set the schema version to %d: %w", version, err)
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit: %w", err)
+	}
+	return nil
 }
 
 func (s *Store) Close() error { return s.db.Close() }
