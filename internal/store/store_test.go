@@ -3,6 +3,7 @@ package store
 import (
 	"database/sql"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
@@ -208,6 +209,48 @@ func TestMigratesOldDatabase(t *testing.T) {
 	defer reopened.Close()
 	if got, err := reopened.Get(added.ID); err != nil || got.SeenAt != nil {
 		t.Errorf("item added after the upgrade: %+v, %v", got, err)
+	}
+}
+
+// A database from a newer condoo is refused rather than used with a schema this one
+// doesn't know.
+func TestRefusesNewerDatabase(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "newer.sqlite")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(fmt.Sprintf("PRAGMA user_version = %d", len(migrations)+1)); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	if s, err := Open(path); err == nil {
+		s.Close()
+		t.Error("opened a database from a newer condoo")
+	}
+}
+
+// A failing step leaves the database at the version before it, with none of its changes.
+func TestFailedMigrationRollsBack(t *testing.T) {
+	s := open(t)
+	if _, err := s.Add(NewTask{Title: "keep"}); err != nil {
+		t.Fatal(err)
+	}
+	step := func(tx *sql.Tx) error {
+		if _, err := tx.Exec("UPDATE tasks SET title = 'changed'"); err != nil {
+			return err
+		}
+		return errors.New("boom")
+	}
+	if err := runMigration(s.db, len(migrations)+1, step); err == nil {
+		t.Fatal("a failing step reported success")
+	}
+	var version int
+	if err := s.db.QueryRow("PRAGMA user_version").Scan(&version); err != nil || version != len(migrations) {
+		t.Errorf("version after a failed step: %d, %v", version, err)
+	}
+	if got, err := s.Get(1); err != nil || got.Title != "keep" {
+		t.Errorf("a failed step's change was kept: %+v, %v", got, err)
 	}
 }
 
