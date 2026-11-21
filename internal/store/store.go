@@ -188,14 +188,12 @@ func migrate(db *sql.DB) error {
 	if err := db.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
 		return err
 	}
-	if version < 1 {
-		// Version 1 shows items nobody has opened as new. Everything from before then counts
-		// as seen, so upgrading lights nothing up. Their unread comments stay unread.
-		if _, err := db.Exec("UPDATE tasks SET seen_at = created_at WHERE seen_at IS NULL"); err != nil {
-			return err
-		}
-		if _, err := db.Exec("PRAGMA user_version = 1"); err != nil {
-			return err
+	if version > len(migrations) {
+		return fmt.Errorf("database is at schema version %d, but this condoo knows up to %d: upgrade condoo", version, len(migrations))
+	}
+	for v := version; v < len(migrations); v++ {
+		if err := runMigration(db, v+1, migrations[v]); err != nil {
+			return fmt.Errorf("migration %d: %w", v+1, err)
 		}
 	}
 	return nil
