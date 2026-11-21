@@ -212,6 +212,114 @@ func TestMigratesOldDatabase(t *testing.T) {
 	}
 }
 
+// An upgraded database from before versions were recorded ends at the same schema as a
+// fresh one, so later migrations can be written against one schema. Defaults aren't
+// compared: todo.py's waiting_on default ('Nigel') was never migrated.
+func TestUpgradedDatabaseMatchesFreshSchema(t *testing.T) {
+	fresh := filepath.Join(t.TempDir(), "fresh.sqlite")
+	s, err := Open(fresh)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+
+	upgraded := filepath.Join(t.TempDir(), "todo.sqlite")
+	db, err := sql.Open("sqlite", upgraded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.Exec(`CREATE TABLE tasks (
+	  id INTEGER PRIMARY KEY AUTOINCREMENT,
+	  parent_id INTEGER REFERENCES tasks(id) ON DELETE CASCADE,
+	  kind TEXT NOT NULL DEFAULT 'task', title TEXT NOT NULL DEFAULT '',
+	  description TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'up_next',
+	  priority TEXT NOT NULL DEFAULT 'normal', waiting_on TEXT NOT NULL DEFAULT 'Nigel',
+	  agent TEXT, terminal TEXT, created_at REAL NOT NULL, updated_at REAL NOT NULL,
+	  status_since REAL NOT NULL)`)
+	db.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err = Open(upgraded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+
+	want, got := schemaShape(t, fresh), schemaShape(t, upgraded)
+	if got != want {
+		t.Errorf("upgraded schema differs from a fresh one:\nfresh:\n%s\nupgraded:\n%s", want, got)
+	}
+}
+
+// schemaShape is each table's columns in order (name, type, not null, primary key), each
+// index by name, and the schema version.
+func schemaShape(t *testing.T, path string) string {
+	t.Helper()
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var version int
+	if err := db.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	out := fmt.Sprintf("version %d\n", version)
+	rows, err := db.Query(`SELECT m.type, m.name, p.name, p.type, p."notnull", p.pk
+	  FROM sqlite_master m LEFT JOIN pragma_table_info(m.name) p
+	  WHERE m.name NOT LIKE 'sqlite_%' ORDER BY m.type, m.name, p.cid`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var typ, name string
+		var col, colType sql.NullString
+		var notnull, pk sql.NullInt64
+		if err := rows.Scan(&typ, &name, &col, &colType, &notnull, &pk); err != nil {
+			t.Fatal(err)
+		}
+		out += fmt.Sprintf("%s %s %s %s %d %d\n", typ, name, col.String, colType.String, notnull.Int64, pk.Int64)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+// A database at the current version runs no migration on open: its schema and its unseen
+// items stay as they are.
+func TestCurrentDatabaseRunsNothing(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "current.sqlite")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unseen, err := s.Add(NewTask{Kind: "question", Title: "unseen", Agent: str("Claude")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Migration 1 would create this index again and mark the item seen.
+	if _, err := s.db.Exec("DROP INDEX tasks_parent"); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	before := schemaSQL(t, path)
+
+	s, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if after := schemaSQL(t, path); after != before {
+		t.Errorf("opening changed the schema:\nbefore: %s\nafter:  %s", before, after)
+	}
+	if got, err := s.Get(unseen.ID); err != nil || got.SeenAt != nil {
+		t.Errorf("opening changed an unseen item: %+v, %v", got, err)
+	}
+}
+
 // A database from a newer condoo is refused rather than used with a schema this one
 // doesn't know.
 func TestRefusesNewerDatabase(t *testing.T) {

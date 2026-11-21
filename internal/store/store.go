@@ -24,38 +24,6 @@ var (
 		"kind", "parent_id", "answer", "summary", "space", "space_name"}
 )
 
-const schema = `
-CREATE TABLE IF NOT EXISTS tasks (
-  id           INTEGER PRIMARY KEY AUTOINCREMENT,
-  parent_id    INTEGER REFERENCES tasks(id) ON DELETE CASCADE,
-  kind         TEXT NOT NULL DEFAULT 'task',
-  title        TEXT NOT NULL DEFAULT '',
-  description  TEXT NOT NULL DEFAULT '',
-  status       TEXT NOT NULL DEFAULT 'up_next',
-  priority     TEXT NOT NULL DEFAULT 'normal',
-  waiting_on   TEXT NOT NULL DEFAULT '',
-  agent        TEXT,
-  terminal     TEXT,
-  created_at   REAL NOT NULL,
-  updated_at   REAL NOT NULL,
-  status_since REAL NOT NULL,
-  answer       TEXT,
-  summary      TEXT NOT NULL DEFAULT '',
-  space        TEXT,
-  space_name   TEXT
-);
-CREATE INDEX IF NOT EXISTS tasks_parent ON tasks(parent_id);
-CREATE TABLE IF NOT EXISTS comments (
-  id         INTEGER PRIMARY KEY AUTOINCREMENT,
-  task_id    INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
-  author     TEXT NOT NULL DEFAULT '',
-  by_agent   INTEGER NOT NULL DEFAULT 0,
-  body       TEXT NOT NULL DEFAULT '',
-  created_at REAL NOT NULL
-);
-CREATE INDEX IF NOT EXISTS comments_task ON comments(task_id);
-`
-
 // Task is one item, as JSON for the panel and agents.
 type Task struct {
 	ID          int64   `json:"id"`
@@ -120,8 +88,8 @@ type Store struct {
 	Now func() time.Time
 }
 
-// Open creates the folder, the file and the table as needed, and adds columns older
-// databases lack.
+// Open creates the folder and the file as needed, and brings the schema up to date by
+// running the migrations the database hasn't had.
 func Open(path string) (*Store, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return nil, err
@@ -147,68 +115,97 @@ func Open(path string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("%s: database is at schema version %d, but this condoo knows up to %d: upgrade condoo", path, version, len(migrations))
 	}
-	if _, err := db.Exec(schema); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("%s: %w", path, err)
-	}
-	if err := migrate(db, version); err != nil {
-		db.Close()
-		return nil, err
+	for v := version; v < len(migrations); v++ {
+		if err := runMigration(db, v+1, migrations[v]); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("%s: migration %d: %w", path, v+1, err)
+		}
 	}
 	return &Store{db: db, Now: time.Now}, nil
 }
 
-func migrate(db *sql.DB, version int) error {
-	rows, err := db.Query("PRAGMA table_info(tasks)")
-	if err != nil {
-		return err
-	}
-	have := map[string]bool{}
-	for rows.Next() {
-		var (
-			cid, notnull, pk int
-			name, typ        string
-			dflt             sql.NullString
-		)
-		if err := rows.Scan(&cid, &name, &typ, &notnull, &dflt, &pk); err != nil {
-			rows.Close()
-			return err
-		}
-		have[name] = true
-	}
-	if err := rows.Err(); err != nil {
-		rows.Close()
-		return err
-	}
-	rows.Close()
-	for _, add := range []struct{ col, ddl string }{
-		{"answer", "ALTER TABLE tasks ADD COLUMN answer TEXT"},
-		{"summary", "ALTER TABLE tasks ADD COLUMN summary TEXT NOT NULL DEFAULT ''"},
-		{"space", "ALTER TABLE tasks ADD COLUMN space TEXT"},
-		{"space_name", "ALTER TABLE tasks ADD COLUMN space_name TEXT"},
-		{"seen_at", "ALTER TABLE tasks ADD COLUMN seen_at REAL"},
-	} {
-		if !have[add.col] {
-			if _, err := db.Exec(add.ddl); err != nil {
-				return err
-			}
-		}
-	}
-	for v := version; v < len(migrations); v++ {
-		if err := runMigration(db, v+1, migrations[v]); err != nil {
-			return fmt.Errorf("migration %d: %w", v+1, err)
-		}
-	}
-	return nil
-}
+// schemaV1 is the schema as it stood when versions began to be recorded (migration 1).
+const schemaV1 = `
+CREATE TABLE IF NOT EXISTS tasks (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  parent_id    INTEGER REFERENCES tasks(id) ON DELETE CASCADE,
+  kind         TEXT NOT NULL DEFAULT 'task',
+  title        TEXT NOT NULL DEFAULT '',
+  description  TEXT NOT NULL DEFAULT '',
+  status       TEXT NOT NULL DEFAULT 'up_next',
+  priority     TEXT NOT NULL DEFAULT 'normal',
+  waiting_on   TEXT NOT NULL DEFAULT '',
+  agent        TEXT,
+  terminal     TEXT,
+  created_at   REAL NOT NULL,
+  updated_at   REAL NOT NULL,
+  status_since REAL NOT NULL,
+  answer       TEXT,
+  summary      TEXT NOT NULL DEFAULT '',
+  space        TEXT,
+  space_name   TEXT,
+  seen_at      REAL
+);
+CREATE INDEX IF NOT EXISTS tasks_parent ON tasks(parent_id);
+CREATE TABLE IF NOT EXISTS comments (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  task_id    INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  author     TEXT NOT NULL DEFAULT '',
+  by_agent   INTEGER NOT NULL DEFAULT 0,
+  body       TEXT NOT NULL DEFAULT '',
+  created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS comments_task ON comments(task_id);
+`
 
 // migrations[i] takes the database from schema version i to i+1. Append new steps; never
 // edit or reorder old ones, and write each against the schema the step before it left.
 var migrations = []func(tx *sql.Tx) error{
-	// 1: items nobody has opened show as new. Everything from before then counts as seen,
-	// so upgrading lights nothing up. Their unread comments stay unread.
+	// 1: the schema, and items nobody has opened show as new. A database from before
+	// versions were recorded (back to the original todo.py) may lack the comments table and
+	// any column added since, so each is created or added only when missing. Everything
+	// from before then counts as seen, so upgrading lights nothing up. Their unread
+	// comments stay unread.
 	func(tx *sql.Tx) error {
-		_, err := tx.Exec("UPDATE tasks SET seen_at = created_at WHERE seen_at IS NULL")
+		if _, err := tx.Exec(schemaV1); err != nil {
+			return err
+		}
+		rows, err := tx.Query("PRAGMA table_info(tasks)")
+		if err != nil {
+			return err
+		}
+		have := map[string]bool{}
+		for rows.Next() {
+			var (
+				cid, notnull, pk int
+				name, typ        string
+				dflt             sql.NullString
+			)
+			if err := rows.Scan(&cid, &name, &typ, &notnull, &dflt, &pk); err != nil {
+				rows.Close()
+				return err
+			}
+			have[name] = true
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return err
+		}
+		rows.Close()
+		for _, add := range []struct{ col, ddl string }{
+			{"answer", "ALTER TABLE tasks ADD COLUMN answer TEXT"},
+			{"summary", "ALTER TABLE tasks ADD COLUMN summary TEXT NOT NULL DEFAULT ''"},
+			{"space", "ALTER TABLE tasks ADD COLUMN space TEXT"},
+			{"space_name", "ALTER TABLE tasks ADD COLUMN space_name TEXT"},
+			{"seen_at", "ALTER TABLE tasks ADD COLUMN seen_at REAL"},
+		} {
+			if !have[add.col] {
+				if _, err := tx.Exec(add.ddl); err != nil {
+					return err
+				}
+			}
+		}
+		_, err = tx.Exec("UPDATE tasks SET seen_at = created_at WHERE seen_at IS NULL")
 		return err
 	},
 }
