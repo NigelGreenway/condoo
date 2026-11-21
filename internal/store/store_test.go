@@ -230,6 +230,60 @@ func TestRefusesNewerDatabase(t *testing.T) {
 	}
 }
 
+// A newer condoo may have renamed or dropped columns this one would add back. Refusing
+// it must leave its schema exactly as the newer condoo left it.
+func TestRefusingNewerDatabaseLeavesSchemaUntouched(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "newer.sqlite")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec("ALTER TABLE tasks RENAME COLUMN space_name TO space_label"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(fmt.Sprintf("PRAGMA user_version = %d", len(migrations)+1)); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	before := schemaSQL(t, path)
+
+	if s, err := Open(path); err == nil {
+		s.Close()
+		t.Fatal("opened a database from a newer condoo")
+	}
+	if after := schemaSQL(t, path); after != before {
+		t.Errorf("refusing changed the schema:\nbefore: %s\nafter:  %s", before, after)
+	}
+}
+
+// schemaSQL is every table and index definition in the database at path.
+func schemaSQL(t *testing.T, path string) string {
+	t.Helper()
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	rows, err := db.Query("SELECT type, name, sql FROM sqlite_master ORDER BY type, name")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var out string
+	for rows.Next() {
+		var typ, name string
+		var def sql.NullString
+		if err := rows.Scan(&typ, &name, &def); err != nil {
+			t.Fatal(err)
+		}
+		out += fmt.Sprintf("%s %s: %s\n", typ, name, def.String)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
 // A failing step leaves the database at the version before it, with none of its changes.
 func TestFailedMigrationRollsBack(t *testing.T) {
 	s := open(t)

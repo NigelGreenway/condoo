@@ -137,18 +137,28 @@ func Open(path string) (*Store, error) {
 		return nil, err
 	}
 	db.SetMaxOpenConns(1)
+	// A newer condoo's database is refused before anything here touches its schema.
+	var version int
+	if err := db.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("%s: %w", path, err)
+	}
+	if version > len(migrations) {
+		db.Close()
+		return nil, fmt.Errorf("%s: database is at schema version %d, but this condoo knows up to %d: upgrade condoo", path, version, len(migrations))
+	}
 	if _, err := db.Exec(schema); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
-	if err := migrate(db); err != nil {
+	if err := migrate(db, version); err != nil {
 		db.Close()
 		return nil, err
 	}
 	return &Store{db: db, Now: time.Now}, nil
 }
 
-func migrate(db *sql.DB) error {
+func migrate(db *sql.DB, version int) error {
 	rows, err := db.Query("PRAGMA table_info(tasks)")
 	if err != nil {
 		return err
@@ -183,13 +193,6 @@ func migrate(db *sql.DB) error {
 				return err
 			}
 		}
-	}
-	var version int
-	if err := db.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
-		return err
-	}
-	if version > len(migrations) {
-		return fmt.Errorf("database is at schema version %d, but this condoo knows up to %d: upgrade condoo", version, len(migrations))
 	}
 	for v := version; v < len(migrations); v++ {
 		if err := runMigration(db, v+1, migrations[v]); err != nil {
