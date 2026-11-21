@@ -1,11 +1,29 @@
 # Condoo
 
-**Context + Todo.** One list for everything your coding agents need from you: their
-questions, their requests, and your own tasks. Agents add items with the `condoo` command;
-you see and answer them in a panel in [Herdr](https://herdr.dev). An answer is typed straight
-back into the agent that asked.
+[![Latest Version](https://img.shields.io/github/release/NigelGreenway/condoo.svg?style=flat-square)](https://github.com/NigelGreenway/condoo/releases)
 
-Runs on Linux, macOS and Windows. A single binary, no runtime to install.
+A silly combining of the words **Context** and **Todo.**, this mod is a list for everything your coding agents need from you: their
+questions, their requests, and your own tasks.
+
+## What this is
+
+The problem I was finding when starting to get into agentic workflows, across multiple domains; was lacking in context, having tasks I needed to do (and multiple tasks from one agent), as well as having to answer the dreaded list of questions - all in one prompt!
+
+So, being [Herdr](https://herdr.dev) is my first introduction to an Integrated Development Environment [ADE] and starting to understand the problem space more, I developed a proof of concept to see if I could solve my problem.
+
+This is it!
+
+## What this is **not**
+
+A way to replace any task list outside of what your agents are doing locally. This is a local only task list with the ability to store the context outside of your brain as we are not built to multi-task.
+
+## How does it work?
+
+Agents add items with the `condoo` command; you see and answer them in a panel in [Herdr](https://herdr.dev). An answer is typed straight back into the agent that asked.
+
+# Setup
+
+Runs on Linux, macOS and Windows via a single binary built with Go
 
 ## Install
 
@@ -21,17 +39,18 @@ curl -fsSL https://github.com/NigelGreenway/condoo/releases/latest/download/inst
 & ([scriptblock]::Create((irm https://github.com/NigelGreenway/condoo/releases/latest/download/install.ps1)))
 ```
 
-The installer asks before each step:
+Running the installer will ask you the following inputs:
 
-1. Where the `condoo` command goes. Default: `~/.local/bin` (Linux, macOS);
-   `%LOCALAPPDATA%\Programs\Condoo` (Windows).
-2. Whether to add that folder to your PATH. Windows: it can add it to your user PATH.
-   Linux and macOS: it prints the line to add and never edits your shell files.
-3. Your name on the list. Default: your login name.
+1. Where the `condoo` command goes. The defaults:
+    Linux/macOS: `~/.local/bin`
+    Windows: `%LOCALAPPDATA%\Programs\Condoo`
+2. Whether to add that folder to your `PATH`:
+    Linux/macOS: It will print the line to add and will never edit your shell files
+    Windows: It can add it to your user `PATH`.
+3. Your name on the list. This defaults to your login name.
 4. Whether to install the Herdr panel.
 
-From a checkout with Go installed, `sh install.sh` (or `.\install.ps1`) builds from source
-instead of downloading. `--help` lists the options, including `--yes` for no questions.
+From a checkout with Go installed, `sh install.sh` (or `.\install.ps1`) builds the CLI from source instead of downloading. `--help` lists the options, including `--yes` for no questions.
 
 ## Set up in Herdr
 
@@ -53,17 +72,29 @@ instead of downloading. `--help` lists the options, including `--yes` for no que
 
 ## Using the panel
 
-Three tabs: **Replies** (agents' requests), **Tasks** (your own) and **Questions**; `[` and `]`
-move between them. Each tab shows how many open items it has, after a dot: grey when it has
-open items, yellow when something in it is new (an agent's item you haven't opened yet, or a
-comment you haven't read). New items carry the yellow dot too, until you open them with `space`.
-Items belong to the Herdr space they were raised in; `w` switches between this space and all.
-The yellow dot counts new items in every space, so you never miss one raised elsewhere.
+There are three tabs; **Replies** (agents' requests), **Tasks** (your own) and **Questions**. 
 
-Closing a space never hides its items. They move under **Detached Spaces**, shown in every
-space and tagged with the old name. Open a space with the same name again (most spaces are
-named after their repo or folder) and they go back into it by themselves. `m` moves an item
-to any space, or to Personal.
+### Replies
+
+If your agent needs your attention from the prompt, they will sit here.
+
+![Example of the requests tab](./preview-replies.png "An example of the replies tab in the Herdr app on the top right")
+
+### Tasks
+
+You can ask your agent to assign tasks for you - whether this is from planning sessions, general discussions, or you can add your own you your own reminders. To enrich these further, you can add comments and assign the task back to the agent.
+
+![Example of the tasks tab](./preview-tasks.png "An example of the tasks tab in the Herdr app on the top right")
+
+### Questions
+
+If your agent needs questions answering, they will be added here. This is useful for when the agent throws loads of questions at your, but you might not be able to answer straight away, but need the agent to do other stuff.
+
+![Example of the questions tab](./preview-questions.png "An example of the questions tab in the Herdr app on the top right")
+
+Each tab displays a dot. It's coloured grey to show it has open items, and yellow when something is new. This could be a new item - or a comment, from the agent.
+
+Closing a space never hides its items. They move under **Detached Spaces**, which are shown in every space and tagged with the old name. Open a space with the same name again, and they go back into the designated space. `m` moves an item to any space, or to Personal.
 
 | Key | Does |
 |---|---|
@@ -79,12 +110,9 @@ to any space, or to Personal.
 | `x` | delete |
 | `?` | every key |
 
-A yellow megaphone marks an item with comments: faint once you've read them, bright when an
-agent has commented since you last opened it. Your comment is also typed into the item's
-agent if it's idle.
+A yellow megaphone marks an item with comments: faint once you've read them, bright when an agent has commented since you last opened it. Your comment is also typed into the item's agent if it's idle.
 
-Answers and comments open in `$VISUAL` or `$EDITOR`. Without one set: `vim`, `vi` or `nano`, or on Windows
-`edit`, `nvim`, `vim`, `nano` or `notepad`, whichever is found first.
+Answers and comments open in `$VISUAL` or `$EDITOR`. Without one set: `vim`, `vi` or `nano`, or on Windows `edit`, `nvim`, `vim`, `nano` or `notepad`, whichever is found first.
 
 ## The command
 
@@ -102,8 +130,7 @@ condoo move 12 --space <space id>          # with its sub-items; --space "" for 
 condoo --help
 ```
 
-Every command prints JSON. Inside Herdr, the agent's terminal is recorded from
-`$HC_TERMINAL_ID`, so answers can be sent back to it.
+Every command prints JSON. Inside Herdr, the agent's terminal is recorded from `$HC_TERMINAL_ID`, so answers can be sent back to it.
 
 ## Settings
 
@@ -146,11 +173,8 @@ go build ./cmd/condoo
 herdr-app check mods/condoo         # the panel
 ```
 
-CI runs the tests and an install, upgrade and uninstall on Linux, macOS and Windows. Pushing a
-`v*` tag builds every binary, runs each on its own OS, and attaches them to a GitHub release
-with `checksums.txt` (see `.github/workflows/release.yml`).
+CI runs the tests and an install, upgrade and uninstall on Linux, macOS and Windows. Pushing a `v*` tag builds every binary, runs each on its own OS, and attaches them to a GitHub release with `checksums.txt` (see `.github/workflows/release.yml`).
 
 ## Licence
 
-Condoo is free software: you can redistribute it and/or modify it under the terms of the
-[GNU General Public License v3.0](LICENSE) as published by the Free Software Foundation.
+Condoo is free software: you can redistribute it and/or modify it under the terms of the [GNU General Public License v3.0](LICENSE) as published by the Free Software Foundation.
