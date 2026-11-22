@@ -3,6 +3,7 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -23,38 +24,6 @@ var (
 	Fields = []string{"title", "description", "status", "priority", "waiting_on", "agent", "terminal",
 		"kind", "parent_id", "answer", "summary", "space", "space_name"}
 )
-
-const schema = `
-CREATE TABLE IF NOT EXISTS tasks (
-  id           INTEGER PRIMARY KEY AUTOINCREMENT,
-  parent_id    INTEGER REFERENCES tasks(id) ON DELETE CASCADE,
-  kind         TEXT NOT NULL DEFAULT 'task',
-  title        TEXT NOT NULL DEFAULT '',
-  description  TEXT NOT NULL DEFAULT '',
-  status       TEXT NOT NULL DEFAULT 'up_next',
-  priority     TEXT NOT NULL DEFAULT 'normal',
-  waiting_on   TEXT NOT NULL DEFAULT '',
-  agent        TEXT,
-  terminal     TEXT,
-  created_at   REAL NOT NULL,
-  updated_at   REAL NOT NULL,
-  status_since REAL NOT NULL,
-  answer       TEXT,
-  summary      TEXT NOT NULL DEFAULT '',
-  space        TEXT,
-  space_name   TEXT
-);
-CREATE INDEX IF NOT EXISTS tasks_parent ON tasks(parent_id);
-CREATE TABLE IF NOT EXISTS comments (
-  id         INTEGER PRIMARY KEY AUTOINCREMENT,
-  task_id    INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
-  author     TEXT NOT NULL DEFAULT '',
-  by_agent   INTEGER NOT NULL DEFAULT 0,
-  body       TEXT NOT NULL DEFAULT '',
-  created_at REAL NOT NULL
-);
-CREATE INDEX IF NOT EXISTS comments_task ON comments(task_id);
-`
 
 // Task is one item, as JSON for the panel and agents.
 type Task struct {
@@ -109,6 +78,10 @@ type NewTask struct {
 	SpaceName   *string
 }
 
+// errNewerSchema: the database was written by a newer condoo, at a schema version this one
+// doesn't know.
+var errNewerSchema = errors.New("database is from a newer condoo")
+
 // ErrNotFound: no item with that id.
 type ErrNotFound struct{ ID int64 }
 
@@ -120,79 +93,205 @@ type Store struct {
 	Now func() time.Time
 }
 
-// Open creates the folder, the file and the table as needed, and adds columns older
-// databases lack.
+// Open creates the folder and the file as needed, and brings the schema up to date by
+// running the migrations the database hasn't had.
 func Open(path string) (*Store, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("create the database folder: %w", err)
 	}
 	// Pragmas in the DSN apply to every pooled connection (foreign keys are per connection).
 	// A plain path (not a file: URI), so spaces (macOS "Application Support") and Windows
 	// drive letters need no escaping. A '?' in the path would end it, so refuse one.
+	// Transactions take the write lock when they begin: one that read first and then wrote
+	// would fail at once with SQLITE_BUSY if another process wrote meanwhile, without
+	// waiting out busy_timeout.
 	if strings.Contains(path, "?") {
 		return nil, fmt.Errorf("database path can't contain '?': %s", path)
 	}
-	db, err := sql.Open("sqlite", path+"?_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)")
+	db, err := sql.Open("sqlite", path+"?_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)&_txlock=immediate")
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%s: open: %w", path, err)
 	}
 	db.SetMaxOpenConns(1)
-	if _, err := db.Exec(schema); err != nil {
+	// A newer condoo's database is refused before anything here touches its schema.
+	var version int
+	if err := db.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
 		db.Close()
-		return nil, fmt.Errorf("%s: %w", path, err)
+		return nil, fmt.Errorf("%s: read the schema version: %w", path, err)
 	}
-	if err := migrate(db); err != nil {
+	if version > len(migrations) {
 		db.Close()
-		return nil, err
+		return nil, fmt.Errorf("%s: %w (schema version %d; this one knows up to %d): upgrade condoo", path, errNewerSchema, version, len(migrations))
+	}
+	for v := version; v < len(migrations); v++ {
+		if err := runMigration(db, v+1, migrations[v]); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("%s: migration %d: %w", path, v+1, err)
+		}
 	}
 	return &Store{db: db, Now: time.Now}, nil
 }
 
-func migrate(db *sql.DB) error {
-	rows, err := db.Query("PRAGMA table_info(tasks)")
-	if err != nil {
-		return err
-	}
-	have := map[string]bool{}
-	for rows.Next() {
-		var (
-			cid, notnull, pk int
-			name, typ        string
-			dflt             sql.NullString
-		)
-		if err := rows.Scan(&cid, &name, &typ, &notnull, &dflt, &pk); err != nil {
-			rows.Close()
-			return err
+// schemaV1 is the schema as it stood when versions began to be recorded (migration 1).
+const schemaV1 = `
+CREATE TABLE IF NOT EXISTS tasks (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  parent_id    INTEGER REFERENCES tasks(id) ON DELETE CASCADE,
+  kind         TEXT NOT NULL DEFAULT 'task',
+  title        TEXT NOT NULL DEFAULT '',
+  description  TEXT NOT NULL DEFAULT '',
+  status       TEXT NOT NULL DEFAULT 'up_next',
+  priority     TEXT NOT NULL DEFAULT 'normal',
+  waiting_on   TEXT NOT NULL DEFAULT '',
+  agent        TEXT,
+  terminal     TEXT,
+  created_at   REAL NOT NULL,
+  updated_at   REAL NOT NULL,
+  status_since REAL NOT NULL,
+  answer       TEXT,
+  summary      TEXT NOT NULL DEFAULT '',
+  space        TEXT,
+  space_name   TEXT,
+  seen_at      REAL
+);
+CREATE INDEX IF NOT EXISTS tasks_parent ON tasks(parent_id);
+CREATE TABLE IF NOT EXISTS comments (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  task_id    INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  author     TEXT NOT NULL DEFAULT '',
+  by_agent   INTEGER NOT NULL DEFAULT 0,
+  body       TEXT NOT NULL DEFAULT '',
+  created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS comments_task ON comments(task_id);
+`
+
+// migration is one step of the schema.
+type migration struct {
+	// foreignKeysOff runs the step with foreign keys off. A step that rebuilds a table
+	// others reference (create a new one, copy, drop the old, rename) needs it: with them
+	// on, dropping the old table deletes the referencing rows through ON DELETE CASCADE.
+	// SQLite can't change it inside a transaction, so it's turned off before the step's
+	// transaction begins and on again after; any reference the step leaves broken fails it.
+	foreignKeysOff bool
+	run            func(tx *sql.Tx) error
+}
+
+// migrations[i] takes the database from schema version i to i+1. Append new steps; never
+// edit or reorder old ones, and write each against the schema the step before it left.
+// Migration 1 was edited once on this branch: no release had it as a list step (0.5.0
+// and master set user_version = 1 inline, from 5209e66), so no database ran an older
+// form. That isn't a precedent: once released, a step is fixed.
+var migrations = []migration{
+	// 1: the schema, and items nobody has opened show as new. A database from before
+	// versions were recorded (back to the original todo.py) may lack the comments table and
+	// any column added since, so each is created or added only when missing. Everything
+	// from before then counts as seen, so upgrading lights nothing up. Their unread
+	// comments stay unread.
+	{run: func(tx *sql.Tx) error {
+		if _, err := tx.Exec(schemaV1); err != nil {
+			return fmt.Errorf("create the tables: %w", err)
 		}
-		have[name] = true
-	}
-	rows.Close()
-	for _, add := range []struct{ col, ddl string }{
-		{"answer", "ALTER TABLE tasks ADD COLUMN answer TEXT"},
-		{"summary", "ALTER TABLE tasks ADD COLUMN summary TEXT NOT NULL DEFAULT ''"},
-		{"space", "ALTER TABLE tasks ADD COLUMN space TEXT"},
-		{"space_name", "ALTER TABLE tasks ADD COLUMN space_name TEXT"},
-		{"seen_at", "ALTER TABLE tasks ADD COLUMN seen_at REAL"},
-	} {
-		if !have[add.col] {
-			if _, err := db.Exec(add.ddl); err != nil {
-				return err
+		rows, err := tx.Query("PRAGMA table_info(tasks)")
+		if err != nil {
+			return fmt.Errorf("read the tasks columns: %w", err)
+		}
+		have := map[string]bool{}
+		for rows.Next() {
+			var (
+				cid, notnull, pk int
+				name, typ        string
+				dflt             sql.NullString
+			)
+			if err := rows.Scan(&cid, &name, &typ, &notnull, &dflt, &pk); err != nil {
+				rows.Close()
+				return fmt.Errorf("scan a tasks column: %w", err)
+			}
+			have[name] = true
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return fmt.Errorf("read the tasks columns: %w", err)
+		}
+		rows.Close()
+		for _, add := range []struct{ col, ddl string }{
+			{"answer", "ALTER TABLE tasks ADD COLUMN answer TEXT"},
+			{"summary", "ALTER TABLE tasks ADD COLUMN summary TEXT NOT NULL DEFAULT ''"},
+			{"space", "ALTER TABLE tasks ADD COLUMN space TEXT"},
+			{"space_name", "ALTER TABLE tasks ADD COLUMN space_name TEXT"},
+			{"seen_at", "ALTER TABLE tasks ADD COLUMN seen_at REAL"},
+		} {
+			if !have[add.col] {
+				if _, err := tx.Exec(add.ddl); err != nil {
+					return fmt.Errorf("add column tasks.%s: %w", add.col, err)
+				}
 			}
 		}
+		if _, err := tx.Exec("UPDATE tasks SET seen_at = created_at WHERE seen_at IS NULL"); err != nil {
+			return fmt.Errorf("mark existing items seen: %w", err)
+		}
+		return nil
+	}},
+}
+
+// runMigration applies one step and records its version in one transaction, so a failed
+// step leaves the database at the version before it and runs again on the next start.
+// Another process may have applied the step while this one waited for the write lock, so
+// the version is read again inside the transaction and the step skipped if it's done. A
+// newer condoo may have upgraded it past what this one knows meanwhile, so that's refused.
+// The pragma and the transaction run on one connection, since foreign_keys is per
+// connection.
+func runMigration(db *sql.DB, version int, step migration) (err error) {
+	ctx := context.Background()
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("get a connection: %w", err)
 	}
-	var version int
-	if err := db.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
+	defer conn.Close()
+	if step.foreignKeysOff {
+		if _, err := conn.ExecContext(ctx, "PRAGMA foreign_keys = OFF"); err != nil {
+			return fmt.Errorf("turn foreign keys off: %w", err)
+		}
+		// Runs after the transaction has ended. If it fails, Open fails and closes the
+		// pool, so the connection with foreign keys off is never used again.
+		defer func() {
+			if _, onErr := conn.ExecContext(ctx, "PRAGMA foreign_keys = ON"); onErr != nil && err == nil {
+				err = fmt.Errorf("turn foreign keys back on: %w", onErr)
+			}
+		}()
+	}
+	tx, err := conn.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin: %w", err)
+	}
+	defer tx.Rollback()
+	var current int
+	if err := tx.QueryRow("PRAGMA user_version").Scan(&current); err != nil {
+		return fmt.Errorf("read the schema version: %w", err)
+	}
+	if current > len(migrations) {
+		return fmt.Errorf("%w (schema version %d; this one knows up to %d): upgrade condoo", errNewerSchema, current, len(migrations))
+	}
+	if current >= version {
+		return nil
+	}
+	if err := step.run(tx); err != nil {
 		return err
 	}
-	if version < 1 {
-		// Version 1 shows items nobody has opened as new. Everything from before then counts
-		// as seen, so upgrading lights nothing up. Their unread comments stay unread.
-		if _, err := db.Exec("UPDATE tasks SET seen_at = created_at WHERE seen_at IS NULL"); err != nil {
-			return err
+	if step.foreignKeysOff {
+		var broken int
+		if err := tx.QueryRow("SELECT count(*) FROM pragma_foreign_key_check").Scan(&broken); err != nil {
+			return fmt.Errorf("check foreign keys: %w", err)
 		}
-		if _, err := db.Exec("PRAGMA user_version = 1"); err != nil {
-			return err
+		if broken > 0 {
+			return fmt.Errorf("the step left %d broken foreign key references", broken)
 		}
+	}
+	if _, err := tx.Exec(fmt.Sprintf("PRAGMA user_version = %d", version)); err != nil {
+		return fmt.Errorf("set the schema version to %d: %w", version, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit: %w", err)
 	}
 	return nil
 }
