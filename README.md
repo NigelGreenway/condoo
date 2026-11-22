@@ -5,6 +5,7 @@
 A silly combining of the words **Context** and **Todo.**, this mod is a list for everything your coding agents need from you: their
 questions, their requests, and your own tasks.
 
+![Example of the questions tab](./preview.png "An example of the questions tab in the Herdr app on the top right")
 ## What this is
 
 The problem I was finding when starting to get into agentic workflows, across multiple domains; was lacking in context, having tasks I needed to do (and multiple tasks from one agent), as well as having to answer the dreaded list of questions - all in one prompt!
