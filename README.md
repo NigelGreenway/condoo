@@ -52,6 +52,14 @@ Running the installer will ask you the following inputs:
 
 From a checkout with Go installed, `sh install.sh` (or `.\install.ps1`) builds the CLI from source instead of downloading. `--help` lists the options, including `--yes` for no questions.
 
+### Upgrading
+
+Run the installer again. It replaces the program in place, and the link and the panel keep
+working. Your list is upgraded the next time anything runs `condoo` (you, an agent or the
+panel); there is no separate step. Each change to the database is applied in order, and in
+its own transaction, so one that fails leaves the list as it was and is tried again next
+time. An older `condoo` refuses a list a newer one has upgraded, and says to upgrade.
+
 ## Set up in Herdr
 
 1. **A key for the panel.** In the `"global"` section of your Herdr `keys.json` (any free key):
@@ -172,6 +180,13 @@ node --test test/*.test.mjs        # the panel's space matching
 go build ./cmd/condoo
 herdr-app check mods/condoo         # the panel
 ```
+
+**Changing the database.** Append a step to `migrations` in `internal/store/store.go`;
+`migrations[i]` takes the schema from version `i` to `i+1` (SQLite's `user_version`). Never
+edit or reorder a released step: write the new one against the schema the last one left.
+A step that rebuilds a table others reference (create, copy, drop, rename) sets
+`foreignKeysOff: true`, or dropping the old table deletes the rows that point at it. Add a
+test in `internal/store/store_test.go` that opens a database at the previous version.
 
 CI runs the tests and an install, upgrade and uninstall on Linux, macOS and Windows. Pushing a `v*` tag builds every binary, runs each on its own OS, and attaches them to a GitHub release with `checksums.txt` (see `.github/workflows/release.yml`).
 
