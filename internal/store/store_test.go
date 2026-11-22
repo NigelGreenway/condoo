@@ -427,9 +427,11 @@ func TestFailedMigrationRollsBack(t *testing.T) {
 	}
 }
 
-// A migration that fails after its version is written leaves the version as it was: the
-// version write is part of the step's transaction. The step itself succeeds; a deferred
-// foreign key it breaks fails the commit, after the version write.
+// A migration whose commit fails is reported as failed, and leaves the version and its
+// row as they were. The step itself succeeds; a deferred foreign key it breaks fails the
+// commit. This relies on the driver rolling back after a failed COMMIT (modernc's tx.go
+// does), which could only make the test fail wrongly, never pass wrongly. It doesn't prove
+// the version write is inside the transaction: writing it after the commit would pass too.
 func TestFailedCommitKeepsVersion(t *testing.T) {
 	s := open(t)
 	step := func(tx *sql.Tx) error {
