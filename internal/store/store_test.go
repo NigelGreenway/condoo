@@ -454,6 +454,27 @@ func TestFailedCommitKeepsVersion(t *testing.T) {
 	}
 }
 
+// A newer condoo may upgrade the database while this one waits for the write lock, after
+// Open's own version check has passed. The step must then refuse, not skip as if done.
+func TestMigrationRefusesVersionUpgradedPastKnown(t *testing.T) {
+	s := open(t)
+	if _, err := s.db.Exec(fmt.Sprintf("PRAGMA user_version = %d", len(migrations)+1)); err != nil {
+		t.Fatal(err)
+	}
+	ran := false
+	step := func(tx *sql.Tx) error {
+		ran = true
+		return nil
+	}
+	err := runMigration(s.db, len(migrations), step)
+	if !errors.Is(err, errNewerSchema) {
+		t.Errorf("a database upgraded past this condoo wasn't refused: %v", err)
+	}
+	if ran {
+		t.Error("the step ran on a database from a newer condoo")
+	}
+}
+
 // Several condoo processes may start at once on a database that needs upgrading (agents
 // running commands side by side). Each must open it, not fail on the lock another holds.
 func TestConcurrentOpensUpgradeOnce(t *testing.T) {

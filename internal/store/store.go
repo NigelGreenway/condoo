@@ -225,7 +225,8 @@ var migrations = []func(tx *sql.Tx) error{
 // runMigration applies one step and records its version in one transaction, so a failed
 // step leaves the database at the version before it and runs again on the next start.
 // Another process may have applied the step while this one waited for the write lock, so
-// the version is read again inside the transaction and the step skipped if it's done.
+// the version is read again inside the transaction and the step skipped if it's done. A
+// newer condoo may have upgraded it past what this one knows meanwhile, so that's refused.
 func runMigration(db *sql.DB, version int, step func(tx *sql.Tx) error) error {
 	tx, err := db.Begin()
 	if err != nil {
@@ -235,6 +236,9 @@ func runMigration(db *sql.DB, version int, step func(tx *sql.Tx) error) error {
 	var current int
 	if err := tx.QueryRow("PRAGMA user_version").Scan(&current); err != nil {
 		return fmt.Errorf("read the schema version: %w", err)
+	}
+	if current > len(migrations) {
+		return fmt.Errorf("%w (schema version %d; this one knows up to %d): upgrade condoo", errNewerSchema, current, len(migrations))
 	}
 	if current >= version {
 		return nil
