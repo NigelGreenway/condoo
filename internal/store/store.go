@@ -167,6 +167,9 @@ CREATE INDEX IF NOT EXISTS comments_task ON comments(task_id);
 
 // migrations[i] takes the database from schema version i to i+1. Append new steps; never
 // edit or reorder old ones, and write each against the schema the step before it left.
+// Migration 1 was edited once on this branch: no release had it as a list step (0.5.0
+// and master set user_version = 1 inline, from 5209e66), so no database ran an older
+// form. That isn't a precedent: once released, a step is fixed.
 var migrations = []func(tx *sql.Tx) error{
 	// 1: the schema, and items nobody has opened show as new. A database from before
 	// versions were recorded (back to the original todo.py) may lack the comments table and
