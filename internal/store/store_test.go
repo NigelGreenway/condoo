@@ -340,7 +340,7 @@ func TestRefusesNewerDatabase(t *testing.T) {
 		s.Close()
 		t.Fatal("opened a database from a newer condoo")
 	}
-	if !errors.Is(err, ErrNewerSchema) {
+	if !errors.Is(err, errNewerSchema) {
 		t.Errorf("refused for another reason: %v", err)
 	}
 }
@@ -367,7 +367,7 @@ func TestRefusingNewerDatabaseLeavesSchemaUntouched(t *testing.T) {
 		s.Close()
 		t.Fatal("opened a database from a newer condoo")
 	}
-	if !errors.Is(err, ErrNewerSchema) {
+	if !errors.Is(err, errNewerSchema) {
 		t.Errorf("refused for another reason: %v", err)
 	}
 	if after := schemaSQL(t, path); after != before {
