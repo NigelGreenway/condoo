@@ -3,6 +3,7 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -165,18 +166,29 @@ CREATE TABLE IF NOT EXISTS comments (
 CREATE INDEX IF NOT EXISTS comments_task ON comments(task_id);
 `
 
+// migration is one step of the schema.
+type migration struct {
+	// foreignKeysOff runs the step with foreign keys off. A step that rebuilds a table
+	// others reference (create a new one, copy, drop the old, rename) needs it: with them
+	// on, dropping the old table deletes the referencing rows through ON DELETE CASCADE.
+	// SQLite can't change it inside a transaction, so it's turned off before the step's
+	// transaction begins and on again after; any reference the step leaves broken fails it.
+	foreignKeysOff bool
+	run            func(tx *sql.Tx) error
+}
+
 // migrations[i] takes the database from schema version i to i+1. Append new steps; never
 // edit or reorder old ones, and write each against the schema the step before it left.
 // Migration 1 was edited once on this branch: no release had it as a list step (0.5.0
 // and master set user_version = 1 inline, from 5209e66), so no database ran an older
 // form. That isn't a precedent: once released, a step is fixed.
-var migrations = []func(tx *sql.Tx) error{
+var migrations = []migration{
 	// 1: the schema, and items nobody has opened show as new. A database from before
 	// versions were recorded (back to the original todo.py) may lack the comments table and
 	// any column added since, so each is created or added only when missing. Everything
 	// from before then counts as seen, so upgrading lights nothing up. Their unread
 	// comments stay unread.
-	func(tx *sql.Tx) error {
+	{run: func(tx *sql.Tx) error {
 		if _, err := tx.Exec(schemaV1); err != nil {
 			return fmt.Errorf("create the tables: %w", err)
 		}
@@ -219,7 +231,7 @@ var migrations = []func(tx *sql.Tx) error{
 			return fmt.Errorf("mark existing items seen: %w", err)
 		}
 		return nil
-	},
+	}},
 }
 
 // runMigration applies one step and records its version in one transaction, so a failed
@@ -227,8 +239,28 @@ var migrations = []func(tx *sql.Tx) error{
 // Another process may have applied the step while this one waited for the write lock, so
 // the version is read again inside the transaction and the step skipped if it's done. A
 // newer condoo may have upgraded it past what this one knows meanwhile, so that's refused.
-func runMigration(db *sql.DB, version int, step func(tx *sql.Tx) error) error {
-	tx, err := db.Begin()
+// The pragma and the transaction run on one connection, since foreign_keys is per
+// connection.
+func runMigration(db *sql.DB, version int, step migration) (err error) {
+	ctx := context.Background()
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("get a connection: %w", err)
+	}
+	defer conn.Close()
+	if step.foreignKeysOff {
+		if _, err := conn.ExecContext(ctx, "PRAGMA foreign_keys = OFF"); err != nil {
+			return fmt.Errorf("turn foreign keys off: %w", err)
+		}
+		// Runs after the transaction has ended. If it fails, Open fails and closes the
+		// pool, so the connection with foreign keys off is never used again.
+		defer func() {
+			if _, onErr := conn.ExecContext(ctx, "PRAGMA foreign_keys = ON"); onErr != nil && err == nil {
+				err = fmt.Errorf("turn foreign keys back on: %w", onErr)
+			}
+		}()
+	}
+	tx, err := conn.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin: %w", err)
 	}
@@ -243,8 +275,17 @@ func runMigration(db *sql.DB, version int, step func(tx *sql.Tx) error) error {
 	if current >= version {
 		return nil
 	}
-	if err := step(tx); err != nil {
+	if err := step.run(tx); err != nil {
 		return err
+	}
+	if step.foreignKeysOff {
+		var broken int
+		if err := tx.QueryRow("SELECT count(*) FROM pragma_foreign_key_check").Scan(&broken); err != nil {
+			return fmt.Errorf("check foreign keys: %w", err)
+		}
+		if broken > 0 {
+			return fmt.Errorf("the step left %d broken foreign key references", broken)
+		}
 	}
 	if _, err := tx.Exec(fmt.Sprintf("PRAGMA user_version = %d", version)); err != nil {
 		return fmt.Errorf("set the schema version to %d: %w", version, err)

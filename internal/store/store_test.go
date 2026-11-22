@@ -415,7 +415,7 @@ func TestFailedMigrationRollsBack(t *testing.T) {
 		}
 		return errors.New("boom")
 	}
-	if err := runMigration(s.db, len(migrations)+1, step); err == nil {
+	if err := runMigration(s.db, len(migrations)+1, migration{run: step}); err == nil {
 		t.Fatal("a failing step reported success")
 	}
 	var version int
@@ -441,7 +441,7 @@ func TestFailedCommitKeepsVersion(t *testing.T) {
 		_, err := tx.Exec("INSERT INTO comments (task_id, created_at) VALUES (999, 1)")
 		return err
 	}
-	if err := runMigration(s.db, len(migrations)+1, step); err == nil {
+	if err := runMigration(s.db, len(migrations)+1, migration{run: step}); err == nil {
 		t.Fatal("a commit breaking a foreign key reported success")
 	}
 	var version int
@@ -466,7 +466,7 @@ func TestMigrationRefusesVersionUpgradedPastKnown(t *testing.T) {
 		ran = true
 		return nil
 	}
-	err := runMigration(s.db, len(migrations), step)
+	err := runMigration(s.db, len(migrations), migration{run: step})
 	if !errors.Is(err, errNewerSchema) {
 		t.Errorf("a database upgraded past this condoo wasn't refused: %v", err)
 	}
@@ -551,10 +551,10 @@ func TestConcurrentOpensRunEachStepOnce(t *testing.T) {
 
 	saved := migrations
 	t.Cleanup(func() { migrations = saved })
-	migrations = append(slices.Clip(saved), func(tx *sql.Tx) error {
+	migrations = append(slices.Clip(saved), migration{run: func(tx *sql.Tx) error {
 		_, err := tx.Exec("ALTER TABLE tasks ADD COLUMN probe TEXT")
 		return err
-	})
+	}})
 
 	for i, err := range openConcurrently(path, 4) {
 		if err != nil {
@@ -564,6 +564,132 @@ func TestConcurrentOpensRunEachStepOnce(t *testing.T) {
 	if got := schemaShape(t, path); !strings.Contains(got, fmt.Sprintf("version %d\n", len(migrations))) ||
 		!strings.Contains(got, "table tasks probe TEXT") {
 		t.Errorf("schema after concurrent upgrades:\n%s", got)
+	}
+}
+
+// rebuildTasks is SQLite's way to make a change ALTER TABLE can't (a column's constraint,
+// default or type): copy tasks into a new table, drop the old one and rename the new one.
+func rebuildTasks(tx *sql.Tx) error {
+	for _, q := range []string{
+		`CREATE TABLE tasks_new (
+		  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+		  parent_id    INTEGER REFERENCES tasks(id) ON DELETE CASCADE,
+		  kind         TEXT NOT NULL DEFAULT 'task',
+		  title        TEXT NOT NULL DEFAULT '',
+		  description  TEXT NOT NULL DEFAULT '',
+		  status       TEXT NOT NULL DEFAULT 'up_next',
+		  priority     TEXT NOT NULL DEFAULT 'normal',
+		  waiting_on   TEXT NOT NULL DEFAULT '',
+		  agent        TEXT,
+		  terminal     TEXT,
+		  created_at   REAL NOT NULL,
+		  updated_at   REAL NOT NULL,
+		  status_since REAL NOT NULL,
+		  answer       TEXT,
+		  summary      TEXT NOT NULL DEFAULT '',
+		  space        TEXT,
+		  space_name   TEXT,
+		  seen_at      REAL)`,
+		"INSERT INTO tasks_new SELECT * FROM tasks",
+		"DROP TABLE tasks",
+		"ALTER TABLE tasks_new RENAME TO tasks",
+		"CREATE INDEX tasks_parent ON tasks(parent_id)",
+	} {
+		if _, err := tx.Exec(q); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func countComments(t *testing.T, s *Store) int {
+	t.Helper()
+	var n int
+	if err := s.db.QueryRow("SELECT count(*) FROM comments").Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+func foreignKeysOn(t *testing.T, s *Store) bool {
+	t.Helper()
+	var on bool
+	if err := s.db.QueryRow("PRAGMA foreign_keys").Scan(&on); err != nil {
+		t.Fatal(err)
+	}
+	return on
+}
+
+// Dropping a table that other tables reference deletes their rows through ON DELETE
+// CASCADE while foreign keys are on, and SQLite can't turn them off inside the step's
+// transaction. A step marked foreignKeysOff rebuilds tasks and keeps every comment, and
+// the references still work afterwards.
+func TestMigrationWithForeignKeysOffKeepsReferencingRows(t *testing.T) {
+	t.Run("foreign keys on: the rebuild deletes the comments", func(t *testing.T) {
+		s := open(t)
+		task, err := s.Add(NewTask{Title: "parent"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.AddComment(task.ID, "Claude", true, "keep me"); err != nil {
+			t.Fatal(err)
+		}
+		if err := runMigration(s.db, len(migrations)+1, migration{run: rebuildTasks}); err != nil {
+			t.Fatal(err)
+		}
+		if n := countComments(t, s); n != 0 {
+			t.Errorf("expected the cascade this option exists for; comments left: %d", n)
+		}
+	})
+
+	t.Run("foreign keys off: the rebuild keeps them", func(t *testing.T) {
+		s := open(t)
+		task, err := s.Add(NewTask{Title: "parent"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.AddComment(task.ID, "Claude", true, "keep me"); err != nil {
+			t.Fatal(err)
+		}
+		if err := runMigration(s.db, len(migrations)+1, migration{foreignKeysOff: true, run: rebuildTasks}); err != nil {
+			t.Fatal(err)
+		}
+		if n := countComments(t, s); n != 1 {
+			t.Errorf("the rebuild lost comments: %d left, want 1", n)
+		}
+		if !foreignKeysOn(t, s) {
+			t.Error("foreign keys were left off after the step")
+		}
+		// The comment still references the rebuilt table: deleting its task cascades.
+		if err := s.Delete(task.ID); err != nil {
+			t.Fatal(err)
+		}
+		if n := countComments(t, s); n != 0 {
+			t.Errorf("deleting the task after the rebuild left %d comments", n)
+		}
+	})
+}
+
+// With foreign keys off nothing stops a step breaking a reference, so it's checked before
+// the commit: a broken one fails the step and leaves the version and the rows as they were.
+func TestMigrationWithForeignKeysOffRefusesBrokenReference(t *testing.T) {
+	s := open(t)
+	step := func(tx *sql.Tx) error {
+		_, err := tx.Exec("INSERT INTO comments (task_id, created_at) VALUES (999, 1)")
+		return err
+	}
+	if err := runMigration(s.db, len(migrations)+1, migration{foreignKeysOff: true, run: step}); err == nil {
+		t.Fatal("a step leaving a broken reference reported success")
+	}
+	var version int
+	if err := s.db.QueryRow("PRAGMA user_version").Scan(&version); err != nil || version != len(migrations) {
+		t.Errorf("version after a refused step: %d, %v", version, err)
+	}
+	if n := countComments(t, s); n != 0 {
+		t.Errorf("a refused step's row was kept: %d", n)
+	}
+	if !foreignKeysOn(t, s) {
+		t.Error("foreign keys were left off after a refused step")
 	}
 }
 
