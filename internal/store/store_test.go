@@ -5,6 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"slices"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -446,6 +449,98 @@ func TestFailedCommitKeepsVersion(t *testing.T) {
 	var comments int
 	if err := s.db.QueryRow("SELECT count(*) FROM comments").Scan(&comments); err != nil || comments != 0 {
 		t.Errorf("a failed commit's row was kept: %d, %v", comments, err)
+	}
+}
+
+// Several condoo processes may start at once on a database that needs upgrading (agents
+// running commands side by side). Each must open it, not fail on the lock another holds.
+func TestConcurrentOpensUpgradeOnce(t *testing.T) {
+	fresh := filepath.Join(t.TempDir(), "fresh.sqlite")
+	s, err := Open(fresh)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	want := schemaShape(t, fresh)
+
+	for round := range 5 {
+		path := filepath.Join(t.TempDir(), "todo.sqlite")
+		db, err := sql.Open("sqlite", path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = db.Exec(`CREATE TABLE tasks (
+		  id INTEGER PRIMARY KEY AUTOINCREMENT,
+		  parent_id INTEGER REFERENCES tasks(id) ON DELETE CASCADE,
+		  kind TEXT NOT NULL DEFAULT 'task', title TEXT NOT NULL DEFAULT '',
+		  description TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'up_next',
+		  priority TEXT NOT NULL DEFAULT 'normal', waiting_on TEXT NOT NULL DEFAULT 'Nigel',
+		  agent TEXT, terminal TEXT, created_at REAL NOT NULL, updated_at REAL NOT NULL,
+		  status_since REAL NOT NULL);
+		INSERT INTO tasks (title, created_at, updated_at, status_since) VALUES ('old one', 1, 1, 1);`)
+		db.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		errs := openConcurrently(path, 4)
+		for i, err := range errs {
+			if err != nil {
+				t.Errorf("round %d, open %d: %v", round, i, err)
+			}
+		}
+		if got := schemaShape(t, path); got != want {
+			t.Errorf("round %d: schema after concurrent upgrades differs from a fresh one:\nfresh:\n%s\nupgraded:\n%s", round, want, got)
+		}
+	}
+}
+
+// openConcurrently opens path from n goroutines at once, each with its own connection
+// pool as separate processes would have, and returns each Open's error.
+func openConcurrently(path string, n int) []error {
+	errs := make([]error, n)
+	var start, done sync.WaitGroup
+	start.Add(1)
+	for i := range n {
+		done.Go(func() {
+			start.Wait()
+			s, err := Open(path)
+			if err == nil {
+				s.Close()
+			}
+			errs[i] = err
+		})
+	}
+	start.Done()
+	done.Wait()
+	return errs
+}
+
+// A step another process applied while this one waited for the lock isn't applied again:
+// a step that isn't idempotent (adding a column) would fail the second time.
+func TestConcurrentOpensRunEachStepOnce(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "current.sqlite")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+
+	saved := migrations
+	t.Cleanup(func() { migrations = saved })
+	migrations = append(slices.Clip(saved), func(tx *sql.Tx) error {
+		_, err := tx.Exec("ALTER TABLE tasks ADD COLUMN probe TEXT")
+		return err
+	})
+
+	for i, err := range openConcurrently(path, 4) {
+		if err != nil {
+			t.Errorf("open %d: %v", i, err)
+		}
+	}
+	if got := schemaShape(t, path); !strings.Contains(got, fmt.Sprintf("version %d\n", len(migrations))) ||
+		!strings.Contains(got, "table tasks probe TEXT") {
+		t.Errorf("schema after concurrent upgrades:\n%s", got)
 	}
 }
 

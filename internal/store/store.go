@@ -101,10 +101,13 @@ func Open(path string) (*Store, error) {
 	// Pragmas in the DSN apply to every pooled connection (foreign keys are per connection).
 	// A plain path (not a file: URI), so spaces (macOS "Application Support") and Windows
 	// drive letters need no escaping. A '?' in the path would end it, so refuse one.
+	// Transactions take the write lock when they begin: one that read first and then wrote
+	// would fail at once with SQLITE_BUSY if another process wrote meanwhile, without
+	// waiting out busy_timeout.
 	if strings.Contains(path, "?") {
 		return nil, fmt.Errorf("database path can't contain '?': %s", path)
 	}
-	db, err := sql.Open("sqlite", path+"?_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)")
+	db, err := sql.Open("sqlite", path+"?_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)&_txlock=immediate")
 	if err != nil {
 		return nil, fmt.Errorf("%s: open: %w", path, err)
 	}
@@ -218,12 +221,21 @@ var migrations = []func(tx *sql.Tx) error{
 
 // runMigration applies one step and records its version in one transaction, so a failed
 // step leaves the database at the version before it and runs again on the next start.
+// Another process may have applied the step while this one waited for the write lock, so
+// the version is read again inside the transaction and the step skipped if it's done.
 func runMigration(db *sql.DB, version int, step func(tx *sql.Tx) error) error {
 	tx, err := db.Begin()
 	if err != nil {
 		return fmt.Errorf("begin: %w", err)
 	}
 	defer tx.Rollback()
+	var current int
+	if err := tx.QueryRow("PRAGMA user_version").Scan(&current); err != nil {
+		return fmt.Errorf("read the schema version: %w", err)
+	}
+	if current >= version {
+		return nil
+	}
 	if err := step(tx); err != nil {
 		return err
 	}
