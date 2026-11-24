@@ -5,3 +5,12 @@
 mods/condoo/bin.json
 mods/condoo/jsconfig.json
 mods/condoo/*.d.ts
+# Written by the installer when the repo root is the installed mod folder
+/bin.json
+/jsconfig.json
+/*.d.ts
+/main
+/main.js
+/mod.json
+/spaces.js
+/*.svg
