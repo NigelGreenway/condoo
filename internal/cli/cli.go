@@ -61,22 +61,39 @@ Commands:
   comment ID TEXT [--agent NAME]
                              a note on an item: by NAME (default $CONDOO_AGENT), else by you
   comments ID                an item's comments, oldest first (get includes them too)
-  config                     your name, the database, and where each came from
-  config set name|db VALUE   save to config.json ("" goes back to the default)
+  assign ID TERMINAL|origin|new [--run CMD]
+                             give an item to a running agent (its terminal), back to the
+                             agent that raised it (origin: it has the context), or start one
+                             (CMD, default claude) in a new tab in the item's space. Agents
+                             answer in comments; you change the status
+  deliver [--terminal ADDR]  type queued answers, comments and assignments into agents
+                             that are idle; busy ones keep theirs for the next try
+  config                     your name, the database, delivery, and where each came from
+  config set KEY VALUE       save to config.json ("" goes back to the default); keys:
+                             name, db, delivery.mode (instant|interval|off),
+                             delivery.interval (seconds, at least 5)
   version
 
 Used by the panel: set-json ID JSON, answer-file ID, answer-save ID PATH, comment-file ID,
 comment-save ID PATH, seen ID.
 
-Environment: CONDOO_NAME, CONDOO_DB, CONDOO_CONFIG override config.json; CONDOO_AGENT,
-HC_TERMINAL_ID fill --agent and --terminal.
+Your answers and comments, and assignments, are typed into the agent's terminal when it's
+idle. Until then they wait in the outbox (the item's "outbox" field). delivery.mode instant
+tries at once and whenever the agent goes idle; interval only on the panel's timer; off
+never.
+
+Environment: CONDOO_NAME, CONDOO_DB, CONDOO_CONFIG, CONDOO_DELIVERY_MODE,
+CONDOO_DELIVERY_INTERVAL override config.json; CONDOO_AGENT, HC_TERMINAL_ID fill --agent
+and --terminal.
 `
 
 // Deps is everything the CLI touches outside the database, so tests can replace it.
 type Deps struct {
 	Sys      config.System
 	Login    func() string
-	HerdrLS  func() []byte // `herdr-app ls` JSON, or nil when Herdr isn't running
+	HerdrLS  func() []byte                                  // `herdr-app ls` JSON, or nil when Herdr isn't running
+	HC       func(args ...string) ([]byte, int, error)      // runs `hc`; nil: deliver nothing now
+	HerdrDo  func(command string, args any) ([]byte, error) // runs a Herdr app command
 	LookPath func(string) (string, error)
 	Now      func() time.Time
 	Stdout   io.Writer
@@ -90,6 +107,8 @@ func Default(version string) Deps {
 		Sys:      config.System{GOOS: runtime.GOOS, Home: home, Env: os.Getenv},
 		Login:    func() string { return config.LoginName(os.Getenv) },
 		HerdrLS:  HerdrLS,
+		HC:       RunHC,
+		HerdrDo:  HerdrDo,
 		LookPath: exec.LookPath,
 		Now:      time.Now,
 		Stdout:   os.Stdout,
@@ -189,6 +208,10 @@ func run(args []string, d Deps) (any, error) {
 		flags, npos = moveFlags, 1
 	case "comment":
 		flags, npos = []flag{{key: "agent", names: []string{"--agent"}}}, 2
+	case "assign":
+		flags, npos = []flag{{key: "run", names: []string{"--run"}}}, 2
+	case "deliver":
+		flags = []flag{{key: "terminal", names: []string{"--terminal"}}}
 	case "set-json", "answer-save", "comment-save":
 		npos = 2
 	case "get", "delete", "answer-file", "comments", "comment-file", "seen":
@@ -224,9 +247,12 @@ func run(args []string, d Deps) (any, error) {
 		if err != nil {
 			return nil, err
 		}
-		return map[string]any{"db": cfg.DB, "name": cfg.Name, "now": float64(st.Now().UnixNano()) / 1e9, "tasks": tasks}, nil
+		return map[string]any{"db": cfg.DB, "name": cfg.Name, "delivery": cfg.Delivery,
+			"now": float64(st.Now().UnixNano()) / 1e9, "tasks": tasks}, nil
 	case "ask", "request", "add":
 		return add(st, cmd, pos[0], opts, cfg, d)
+	case "deliver":
+		return deliver(st, opts["terminal"], d)
 	}
 
 	id, err := strconv.ParseInt(pos[0], 10, 64)
@@ -266,10 +292,20 @@ func run(args []string, d Deps) (any, error) {
 	case "answer-file":
 		return answerFile(st, id, d)
 	case "answer-save":
-		return answerSave(st, id, pos[1])
+		return answerSave(st, id, pos[1], cfg, d)
 	case "comment":
 		author, byAgent := commentAuthor(opts, cfg, d)
-		return st.AddComment(id, author, byAgent, pos[1])
+		return addComment(st, id, author, byAgent, pos[1], cfg, d)
+	case "assign":
+		t, err := st.Get(id)
+		if err != nil {
+			return nil, err
+		}
+		to := strings.TrimSpace(pos[1])
+		if to == "" {
+			return nil, bad("assign needs a terminal, origin or new")
+		}
+		return assign(st, t, to, opts, cfg, d)
 	case "comments":
 		t, err := st.Get(id)
 		if err != nil {
@@ -279,7 +315,7 @@ func run(args []string, d Deps) (any, error) {
 	case "comment-file":
 		return commentFile(st, id, d)
 	case "comment-save":
-		return commentSave(st, id, pos[1], cfg)
+		return commentSave(st, id, pos[1], cfg, d)
 	case "seen":
 		return st.Seen(id)
 	}
@@ -381,7 +417,7 @@ func configCmd(args []string, d Deps) (any, error) {
 		return config.Resolve(d.Sys, d.Login)
 	}
 	if args[0] != "set" || len(args) != 3 {
-		return nil, bad("usage: condoo config [set name|db VALUE]")
+		return nil, bad("usage: condoo config [set name|db|delivery.mode|delivery.interval VALUE]")
 	}
 	path := config.ConfigFile(d.Sys)
 	f, err := config.Read(path)
@@ -393,8 +429,33 @@ func configCmd(args []string, d Deps) (any, error) {
 		f.Name = strings.TrimSpace(args[2])
 	case "db":
 		f.DB = strings.TrimSpace(args[2])
+	case "delivery.mode", "delivery.interval":
+		if f.Delivery == nil {
+			f.Delivery = &config.DeliveryFile{}
+		}
+		v := strings.TrimSpace(args[2])
+		if args[1] == "delivery.mode" {
+			if v != "" {
+				if err := config.CheckDeliveryMode(v); err != nil {
+					return nil, usageError{err}
+				}
+			}
+			f.Delivery.Mode = v
+		} else {
+			f.Delivery.Interval = 0
+			if v != "" {
+				n, err := config.ParseDeliveryInterval(v)
+				if err != nil {
+					return nil, usageError{err}
+				}
+				f.Delivery.Interval = n
+			}
+		}
+		if *f.Delivery == (config.DeliveryFile{}) {
+			f.Delivery = nil
+		}
 	default:
-		return nil, bad("config keys: name, db")
+		return nil, bad("config keys: name, db, delivery.mode, delivery.interval")
 	}
 	if err := config.Write(path, f); err != nil {
 		return nil, err
@@ -460,7 +521,7 @@ func Editor(d Deps) []string {
 	return []string{candidates[0]}
 }
 
-func answerSave(st *store.Store, id int64, path string) (any, error) {
+func answerSave(st *store.Store, id int64, path string, cfg config.Resolved, d Deps) (any, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
@@ -483,7 +544,22 @@ func answerSave(st *store.Store, id int64, path string) (any, error) {
 	if t.Agent != nil && *t.Agent != "" {
 		waiting = *t.Agent
 	}
-	return st.Update(id, map[string]any{"answer": text, "status": "completed", "waiting_on": waiting})
+	saved, err := st.Update(id, map[string]any{"answer": text, "status": "completed", "waiting_on": waiting})
+	if err != nil {
+		return nil, err
+	}
+	if t.Terminal == nil || *t.Terminal == "" {
+		return saved, nil
+	}
+	state, err := notify(st, saved, *t.Terminal, "answer", answerMessage(saved, text), cfg, d)
+	if err != nil {
+		return nil, err
+	}
+	saved, err = st.Get(id)
+	if err != nil {
+		return nil, err
+	}
+	return withDelivery(saved, state)
 }
 
 // HerdrLS asks the open Herdr window for its spaces (nil if it can't).
@@ -538,6 +614,14 @@ func SpaceIn(lsJSON []byte, terminal string) (string, string) {
 	var has func([]json.RawMessage) bool
 	has = func(list []json.RawMessage) bool {
 		for _, raw := range list {
+			// A sub-agent is listed by its address alone; a pane's terminal as an object.
+			var addr string
+			if json.Unmarshal(raw, &addr) == nil {
+				if addr == terminal {
+					return true
+				}
+				continue
+			}
 			var t term
 			if json.Unmarshal(raw, &t) != nil {
 				continue
@@ -603,7 +687,7 @@ func commentFile(st *store.Store, id int64, d Deps) (any, error) {
 }
 
 // commentSave posts the draft as the person's comment and removes it.
-func commentSave(st *store.Store, id int64, path string, cfg config.Resolved) (any, error) {
+func commentSave(st *store.Store, id int64, path string, cfg config.Resolved, d Deps) (any, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
@@ -613,5 +697,27 @@ func commentSave(st *store.Store, id int64, path string, cfg config.Resolved) (a
 	if text = strings.TrimSpace(text); text == "" {
 		return map[string]bool{"cancelled": true}, nil
 	}
-	return st.AddComment(id, cfg.Name, false, text)
+	return addComment(st, id, cfg.Name, false, text, cfg, d)
+}
+
+// addComment posts a comment. The person's go to the item's agent (its assignee, else who
+// raised it); an agent's own never go back to agents.
+func addComment(st *store.Store, id int64, author string, byAgent bool, body string, cfg config.Resolved, d Deps) (any, error) {
+	c, err := st.AddComment(id, author, byAgent, body)
+	if err != nil || byAgent {
+		return c, err
+	}
+	t, err := st.Get(id)
+	if err != nil {
+		return nil, err
+	}
+	to := recipient(t)
+	if to == "" {
+		return c, nil
+	}
+	state, err := notify(st, t, to, "comment", commentMessage(t, author, c.Body), cfg, d)
+	if err != nil {
+		return nil, err
+	}
+	return withDelivery(c, state)
 }

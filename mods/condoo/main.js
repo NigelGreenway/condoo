@@ -10,7 +10,13 @@
 //     hide the column it sits in with your sidebar key instead.
 //   - the answer bar (props.role "answer-bar"): the title over the editor terminal in the
 //     answer dialog. Enter on a question opens $EDITOR there; on exit the answer is stored and
-//     typed into the asking agent if it's idle.
+//     queued for the asking agent.
+//   - the assign picker (props.role "assign"): A on an item gives it to a running agent or
+//     starts a new one.
+//
+// Delivery: answers, comments and assignments wait in Condoo's outbox until the agent is idle.
+// `condoo` tries at once; the panel runs `condoo deliver` for an agent the moment it goes
+// idle (delivery.mode "instant") and on a timer (every delivery.interval_seconds).
 //   - the help (props.role "help"): `?` opens a dialog summarising the sections and keys.
 
 import { View, div, svg } from "gpui-kit";
@@ -18,6 +24,7 @@ import { v_flex, h_flex, InputState, Input, TextareaState, Textarea, TextView, S
 import {
   props, theme, settings, exec, appHome, home, run, layout, focused, keys, readTextFile, machines,
   shared, setShared, closeOverlay, openOverlay, nextCommand, notify, hc, terminals, spaces, panes,
+  agents, knownAgents, checking,
 } from "herdr";
 import { spaceIndex as spaceIndexOf, DETACHED } from "./spaces.js";
 
@@ -49,6 +56,20 @@ const SHOWN_COMMENTS = 5; // the latest few; "show N earlier" for the rest
 // f cycles: open (null: everything but completed and cancelled), each status, then all.
 const FILTERS = [null, ...STATUSES, "all"];
 const POLL_MS = 4000;
+const IDLE_MS = 2000;         // how often a hidden panel checks for agents going idle
+const SEND_TIMEOUT = 120000;  // commands that may type into an agent: hc waits out a draft there
+// An agent's status, from a terminal: hc's {state} or a plain string.
+const statusOf = (term) => term?.status?.state ?? term?.status ?? null;
+
+// Every live terminal's agent status, by address: agents() (panes), and terminals() for the
+// rest (sub-agents have no pane).
+function liveStatuses() {
+  const out = new Map();
+  for (const term of terminals()) if (term.state === undefined || term.state === "live") out.set(term.address, statusOf(term));
+  for (const a of agents()) out.set(a.address, a.status ?? null);
+  return out;
+}
+const READY = new Set(["idle", "done"]);
 const DRAFT_LABEL = "condoo.draft"; // on an editor terminal: what it drafts, "answer:ID" | "comment:ID"
 const PATH_LABEL = "condoo.path";   // on an editor terminal: the draft file
 
@@ -71,7 +92,8 @@ const HELP = [
     ["a o", "add an item to this section"],
     [">", "add a sub-task"],
     ["e", "edit"],
-    ["c", "comment, in $EDITOR (typed into the agent too, if it's idle; a draft still open opens again)"],
+    ["c", "comment, in $EDITOR (a draft still open opens again); it reaches the item's agent when it's idle"],
+    ["A", "assign to an agent (it answers in comments; you close it): who raised it (it has the context), a new one in the item's space, or any running one"],
     ["s S", "next / previous status"],
     ["p P", "next / previous priority"],
     ["m", "move to another space (with its sub-tasks)"],
@@ -85,6 +107,7 @@ const HELP = [
     ["{toggle}", "show the panel and focus it"],
     ["?", "this help"],
   ]],
+  ["Reaching agents", "Answers, comments and assignments wait in an outbox until the agent is idle, then go in as one message. ⏳ on an item: still waiting. A spinner: it reached the agent, which is at work and hasn't replied yet. ● needs you: the agent is waiting on a prompt. ✓ delivered: it went in, and the agent stopped without replying. ✗: its agent has ended (assign it to another). Set when they go in config.json's delivery block: mode instant (as soon as possible), interval (every interval_seconds) or off.", []],
   ["Editing", null, [
     ["tab  shift-tab", "next / previous field"],
     ["enter", "next field (a new line in Description)"],
@@ -136,11 +159,11 @@ async function condooPath() {
   return "condoo";
 }
 
-async function cli(args) {
+async function cli(args, timeout = 10000) {
   const bin = await condooPath();
   let r;
   try {
-    r = await exec(bin, args, { timeout: 10000 });
+    r = await exec(bin, args, { timeout });
   } catch (e) {
     throw new Error(`Can't run ${bin}: is Condoo installed? (${e.message ?? e})`);
   }
@@ -182,10 +205,11 @@ function ago(seconds) {
 export default class Condoo extends View {
   init(_props, cx) {
     if (props()?.role === "answer-bar") return;
-    if (props()?.role === "help" || props()?.role === "move") {
+    if (props()?.role === "help" || props()?.role === "move" || props()?.role === "assign") {
       this.h = cx.focus_handle();
       this.pick = 0;
       cx.timer.after(30, () => this.h.focus());
+      if (props()?.role === "assign") this.loadKnownAgents(cx);
       return;
     }
     if (props()?.overlay && props()?.role !== "panel") return this.focusPanel(cx);
@@ -231,6 +255,15 @@ export default class Condoo extends View {
     this.reloadToken = shared(RELOAD) ?? null; // only later moves trigger a reload
     this.reload(cx);
     cx.timer.every(POLL_MS, (cx) => { if (this.mode === "nav" && this.visible()) this.reload(cx); });
+
+    // Delivery: see the top of the file.
+    this.delivery = { mode: "instant", interval_seconds: 30 }; // until `condoo list` says
+    this.lastStatus = new Map(); // terminal → its agent status when last looked at
+    this.delivering = new Set(); // terminals (or "*") with a `condoo deliver` running
+    this.lastSweep = Date.now();
+    if (!checking()) {
+      cx.timer.every(IDLE_MS, (cx) => this.deliveryTick(cx));
+    }
     cx.spawn(async (cx) => {
       for (;;) {
         const c = await nextCommand();
@@ -269,6 +302,7 @@ export default class Condoo extends View {
         this.tasks = out.tasks;
         this.userName = out.name;
         this.db = out.db;
+        if (out.delivery) this.delivery = out.delivery;
         this.error = null;
         // Follow renamed spaces, and spaces closed and opened again with the same name.
         const idx = spaceIndex();
@@ -552,6 +586,10 @@ export default class Condoo extends View {
       const n = spaces().length + 1;
       openOverlay({ mod: "condoo", props: { role: "move", task: root.id, title: root.title, space: this.idx?.of(root) ?? null },
         kind: "dialog", width: 360, height: Math.min(520, 96 + n * 30) });
+    } else if (ch === "A") {
+      const n = agents().length + 2;
+      openOverlay({ mod: "condoo", props: { role: "assign", task: task.id, title: task.title, space: task.space ?? null,
+        assignee: task.assignee ?? null, origin: task.terminal || null }, kind: "dialog", width: 400, height: Math.min(560, 120 + n * 30) });
     } else if (ch === "x") {
       this.mode = "confirm";
     } else if (e.key === "enter") {
@@ -575,6 +613,7 @@ export default class Condoo extends View {
     if (props()?.role === "answer-bar") return this.answerBar();
     if (props()?.role === "help") return this.help();
     if (props()?.role === "move") return this.movePicker();
+    if (props()?.role === "assign") return this.assignPicker();
     if (props()?.overlay && props()?.role !== "panel") return div();
     const t = theme();
     const c = palette(settings().dark !== false);
@@ -587,6 +626,8 @@ export default class Condoo extends View {
     }
 
     // The focus key asked for the keyboard.
+    this.watchIdle(cx);
+
     const token = shared(FOCUS);
     if (token && token !== this.focusToken) {
       this.focusToken = token;
@@ -606,6 +647,7 @@ export default class Condoo extends View {
     const here = this.here();
     const open = (x) => !x.parent_id && !CLOSED.has(x.status);
     const elsewhere = this.allSpaces ? 0 : this.tasks.filter((x) => open(x) && !this.inScope(x, idx)).length;
+    const statuses = liveStatuses();
 
     const children = rows.map((r, i) => {
       if (r.divider) {
@@ -664,6 +706,11 @@ export default class Condoo extends View {
             .when(drafts.has(`answer:${task.id}`) || drafts.has(`comment:${task.id}`), (el) => el.child(
               h_flex().flex_none().gap(3).px(5).rounded(4).bg(t.raised).text_size(10.5).text_color(t.blocked)
                 .child("✎").child(drafts.has(`answer:${task.id}`) ? "answer open" : "comment open")))
+            .when(task.outbox?.some((d) => d.state === "pending"), (el) => el.child(div().flex_none().px(5).rounded(4)
+              .bg(t.raised).text_size(10.5).text_color(t.working).child("⏳ queued")))
+            .when(task.outbox?.some((d) => d.state === "dead"), (el) => el.child(div().flex_none().px(5).rounded(4)
+              .bg(t.raised).text_size(10.5).text_color(c.red).child("✗ not delivered")))
+            .when(Boolean(this.deliveryState(task, statuses)), (el) => el.child(this.deliveryChip(t, this.deliveryState(task, statuses))))
             .when(task.comments?.length > 0, (el) => el.child(svg("mods/condoo/megaphone.svg").size(13).flex_none()
               .text_color(t.ansi3).opacity(unread(task) ? 1 : 0.4)))
             .when(full, (el) => el.child(div().flex_none().opacity(0.4).text_size(11).text_color(t.foreground).child(`${days}d`))))
@@ -680,6 +727,8 @@ export default class Condoo extends View {
               .text_color(statusColor(task.status))
               .when(task.status === "up_next", (el) => el.opacity(0.4))
               .child(STATUS_LABEL[task.status] ?? task.status))
+            .when(Boolean(task.assignee), (el) => el.child(div().flex_none().text_color(t.muted)
+              .child(`→ ${this.agentName(task.assignee)}`)))
             .child(div().flex_none().text_color(c.yellow).child(task.waiting_on || ""))))
           .when(this.expanded === task.id, (el) => el.child(
             v_flex().mt(6).p(8).rounded(6).bg(t.background).border_1().border_color(t.border)
@@ -864,41 +913,123 @@ export default class Condoo extends View {
     }
   }
 
-  // Types a message into the item's agent if it's still running and idle. Returns
-  // "sent", "busy" (saved, not typed) or null (no agent to tell).
-  async tellAgent(task, msg) {
-    if (!task.terminal || !terminals().some((x) => x.address === task.terminal)) return null;
-    const sent = await hc(["send", "--if", "idle", task.terminal, msg]);
-    return sent.code === 0 ? "sent" : "busy";
+  // The toast for a saved answer or comment, from how its delivery went ("sent", "queued",
+  // "gone", or none: there's no agent to tell).
+  deliveryToast(what, task, to, out) {
+    const who = this.agentName(to) || task.agent || "the agent";
+    const queued = this.delivery?.mode === "off" ? "Delivery is off (config.json): it stays in the outbox."
+      : this.delivery?.mode === "interval" ? `It goes in on the next delivery (every ${this.delivery.interval_seconds}s) when ${who} is idle.`
+      : `It goes in as soon as ${who} is idle.`;
+    notify(out.delivery === "sent" ? { title: `${what} sent to ${who}`, body: task.title, level: "success", timeout: 3000 }
+      : out.delivery === "queued" ? { title: `${what} queued for ${who}`, body: queued, level: "info", timeout: 5000 }
+      : out.delivery === "gone" ? { title: `${what} saved, not sent`, body: `${who} has ended. Assign #${task.id} to another agent (A).`, level: "warning", timeout: 6000 }
+      : { title: `${what} saved`, body: task.title, level: "success", timeout: 3000 });
   }
 
-  // Enter on a question: store the answer and hand it to the agent.
+  // Enter on a question: store the answer; condoo hands it to the agent.
   async saveAnswer(task, path) {
-    const out = await cli(["answer-save", String(task.id), path]);
-    const who = task.agent || task.terminal;
+    const out = await cli(["answer-save", String(task.id), path], SEND_TIMEOUT);
     if (out.cancelled) {
       return notify({ title: "No answer saved", body: task.title, level: "info", timeout: 3000 });
     }
-    const told = await this.tellAgent(task, `Answer to your question (condoo #${task.id}) "${task.title}":\n\n${out.answer}`);
-    notify(told === "sent" ? { title: `Answer sent to ${who}`, body: task.title, level: "success", timeout: 3000 }
-      : told === "busy" ? { title: "Answer saved, not sent", body: `${who} is busy. It can read it with condoo get ${task.id}.`, level: "warning", timeout: 6000 }
-      : { title: "Answer saved", body: task.title, level: "success", timeout: 3000 });
+    this.deliveryToast("Answer", task, task.terminal, out);
   }
 
-  // c: a comment, posted as the person and typed into the item's agent if it's idle.
+  // c: a comment, posted as the person; condoo hands it to the item's agent (its assignee,
+  // else who raised it).
   async saveComment(task, path) {
-    const out = await cli(["comment-save", String(task.id), path]);
-    const who = task.agent || task.terminal;
+    const out = await cli(["comment-save", String(task.id), path], SEND_TIMEOUT);
     if (out.cancelled) {
       return notify({ title: "No comment posted", body: task.title, level: "info", timeout: 3000 });
     }
     this.expanded = task.id;
-    const told = await this.tellAgent(task,
-      `Comment from ${out.author} on condoo #${task.id} "${task.title}":\n\n${out.body}`);
-    notify(told === "sent" ? { title: `Comment sent to ${who}`, body: task.title, level: "success", timeout: 3000 }
-      : told === "busy" ? { title: "Comment saved, not sent", body: `${who} is busy. It can read it with condoo get ${task.id}.`, level: "warning", timeout: 6000 }
-      : { title: "Comment saved", body: task.title, level: "success", timeout: 3000 });
+    this.deliveryToast("Comment", task, task.assignee || task.terminal, out);
     await cli(["seen", String(task.id)]);
+  }
+
+  // ---------- delivery ----------
+
+  // What happened to the last message that reached an item's agent, while it's still news:
+  // "working" (the agent is at it: we only deliver to idle agents, so most likely on this),
+  // "blocked" (it's waiting on a prompt), "delivered" (it went idle without replying), or null
+  // (nothing delivered, still queued, it has replied since, the item is closed or the agent ended).
+  deliveryState(task, statuses) {
+    const d = task.last_delivery;
+    if (!d || CLOSED.has(task.status) || !statuses.has(d.terminal)) return null;
+    if (task.outbox?.some((x) => x.state === "pending")) return null;
+    if ((task.comments ?? []).some((c) => c.by_agent && c.created_at >= d.delivered_at)) return null;
+    const st = statuses.get(d.terminal);
+    const who = agents().find((a) => a.address === d.terminal)?.program?.name ?? "Agent";
+    return { state: st === "working" ? "working" : st === "blocked" ? "blocked" : "delivered", who };
+  }
+
+  deliveryChip(t, ds) {
+    const chip = h_flex().flex_none().gap(4).px(5).rounded(4).items_center().bg(t.raised).text_size(10.5);
+    if (ds.state === "working") {
+      return chip.text_color(t.working)
+        .child(svg("mods/condoo/spinner.svg").size(10).flex_none().text_color(t.working).spin(900))
+        .child(`${ds.who} on it`);
+    }
+    if (ds.state === "blocked") return chip.text_color(t.blocked).child(`● ${ds.who} needs you`);
+    return chip.text_color(t.dim).child("✓ delivered");
+  }
+
+  // A terminal's name for people: its agent's name (or the terminal's), then its address.
+  agentName(addr) {
+    if (!addr) return "";
+    const a = agents().find((x) => x.address === addr);
+    if (a) return `${a.program?.name ?? a.app ?? "agent"} (${addr})`;
+    const term = terminals().find((x) => x.address === addr);
+    return term?.name ? `${term.name} (${addr})` : addr;
+  }
+
+  // Agents that just went idle (or done) get what's waiting for them at once, in instant mode.
+  // Runs on every render (agents' status changes re-render) and on a timer while hidden.
+  watchIdle(cx) {
+    if (checking() || !this.lastStatus) return;
+    const ready = [];
+    for (const [addr, st] of liveStatuses()) {
+      const was = this.lastStatus.get(addr);
+      if (st !== was) {
+        this.lastStatus.set(addr, st);
+        if (was !== undefined && READY.has(st) && !READY.has(was)) ready.push(addr);
+      }
+    }
+    if (this.delivery?.mode !== "instant") return;
+    for (const addr of ready) cx.timer.after(0, (cx) => this.runDeliver(addr, cx));
+  }
+
+  deliveryTick(cx) {
+    this.watchIdle(cx);
+    const d = this.delivery;
+    if (!d || d.mode === "off") return;
+    if (Date.now() - this.lastSweep < (d.interval_seconds ?? 30) * 1000) return;
+    this.lastSweep = Date.now();
+    this.runDeliver(null, cx);
+  }
+
+  // `condoo deliver` for one terminal, or all (addr null). Reloads when something went in or died.
+  runDeliver(addr, cx) {
+    const key = addr ?? "*";
+    if (this.delivering.has(key)) return;
+    this.delivering.add(key);
+    cx.spawn(async (cx) => {
+      try {
+        const out = await cli(addr ? ["deliver", "--terminal", addr] : ["deliver"], SEND_TIMEOUT);
+        for (const s of out.sends ?? []) {
+          if (s.result === "sent") {
+            notify({ title: `Condoo: delivered to ${this.agentName(s.terminal)}`,
+              body: `${s.ids.length} queued message${s.ids.length === 1 ? "" : "s"}`, level: "success", timeout: 3000 });
+          } else if (s.result === "gone") {
+            notify({ title: "Condoo: an agent has ended", body: `${this.agentName(s.terminal)} won't get ${s.ids.length} queued message${s.ids.length === 1 ? "" : "s"}.`, level: "warning", timeout: 6000 });
+          }
+        }
+        if ((out.delivered || out.dead) && this.visible()) this.reload(cx);
+      } catch (e) {
+        console.log(`condoo deliver: ${e.message ?? e}`);
+      }
+      this.delivering.delete(key);
+    });
   }
 
   // Opening an item reads its comments.
@@ -946,7 +1077,7 @@ export default class Condoo extends View {
 
   // However the help closes (its keys, Herdr's Esc, a click beside it), give the panel the keyboard back.
   async close(_cx) {
-    if (props()?.role === "help" || props()?.role === "move") setShared(FOCUS, Date.now());
+    if (["help", "move", "assign"].includes(props()?.role)) setShared(FOCUS, Date.now());
     if (props()?.role === "panel") setShared(DIALOG, null);
   }
 
@@ -1003,6 +1134,92 @@ export default class Condoo extends View {
         })))
       .child(div().flex_none().px(16).py(8).border_t_1().border_color(t.border).text_size(11).text_color(t.dim)
         .child("j k move · enter moves it and its sub-tasks · esc cancels"));
+  }
+
+  // A: the installed agents that can be started (for "New …"); Claude until known.
+  loadKnownAgents(cx) {
+    this.known = [{ name: "Claude Code", run: ["claude"] }];
+    if (checking()) return;
+    cx.spawn(async (cx) => {
+      try {
+        const list = (await knownAgents()).filter((a) => a.installed && a.run?.length);
+        if (list.length) { this.known = list; cx.notify(); }
+      } catch (_e) { /* keep Claude */ }
+    });
+  }
+
+  // A: who to give an item to. The agent that raised it first while it's running (it has the
+  // context), then new agents (in the item's space), then the other running agents, the item's
+  // space's first.
+  assignTargets() {
+    const p = props();
+    const label = (a) => `${a.program?.name ?? a.app ?? "Agent"} · ${a.tab_name || a.title || a.address}`;
+    const origin = p.origin && agents().find((a) => a.address === p.origin);
+    const first = origin ? [{ id: "origin", address: origin.address, name: `Who raised it: ${label(origin)}`,
+      note: "has the context", status: origin.status }] : [];
+    const fresh = (this.known ?? []).map((a) => ({ id: "new", run: a.run, name: `New ${a.name}`,
+      note: p.space ? "new tab, this item's space" : "new tab" }));
+    const running = agents().filter((a) => a.address !== p.origin).map((a) => ({ id: a.address, address: a.address,
+      name: label(a), note: a.space_name, status: a.status, here: a.space === p.space }));
+    running.sort((a, b) => Number(b.here) - Number(a.here));
+    return [...first, ...fresh, ...running];
+  }
+
+  assignPicker() {
+    const t = theme();
+    const p = props();
+    const targets = this.assignTargets();
+    this.pick = Math.max(0, Math.min(targets.length - 1, this.pick));
+    const choose = (target, cx) => {
+      if (this.assigning) return;
+      this.assigning = true;
+      cx.notify();
+      // Close the dialog only after condoo is done: closing it cancels this task.
+      cx.spawn(async (_cx) => {
+        try {
+          const args = ["assign", String(p.task), target.id];
+          if (target.id === "new") args.push("--run", target.run.map((w) => (/\s/.test(w) ? `"${w}"` : w)).join(" "));
+          const out = await cli(args, SEND_TIMEOUT);
+          const who = target.id === "new" ? target.name.replace(/^New /, "")
+            : target.id === "origin" ? target.name.replace(/^Who raised it: /, "") : target.name;
+          notify(out.delivery === "started" ? { title: `Started ${who} on #${p.task}`, body: p.title, level: "success", timeout: 3000 }
+            : out.delivery === "sent" ? { title: `Assigned #${p.task} to ${who}`, body: p.title, level: "success", timeout: 3000 }
+            : out.delivery === "gone" ? { title: "Assigned, but that agent has ended", body: p.title, level: "warning", timeout: 5000 }
+            : { title: `Assigned #${p.task} to ${who}`, body: "It's told as soon as it's idle.", level: "info", timeout: 4000 });
+          setShared(RELOAD, Date.now());
+        } catch (e) {
+          notify({ title: "Condoo: assigning failed", body: String(e.message ?? e), level: "error", timeout: 6000 });
+        }
+        closeOverlay(p.overlay);
+      });
+    };
+    return v_flex().id("condoo-assign").size_full().min_h(0).bg(t.popover).text_color(t.foreground)
+      .track_focus(this.h)
+      .on_key_down((e, cx) => {
+        const ch = e.key_char ?? null;
+        if (ch === "j" || e.key === "down") this.pick = Math.min(targets.length - 1, this.pick + 1);
+        else if (ch === "k" || e.key === "up") this.pick = Math.max(0, this.pick - 1);
+        else if (e.key === "enter") return (choose(targets[this.pick], cx), cx.stop_propagation());
+        else if (e.key === "escape" || ch === "q") return (closeOverlay(p.overlay), cx.stop_propagation());
+        else return;
+        cx.stop_propagation();
+        cx.notify();
+      })
+      .child(v_flex().flex_none().px(16).pt(14).pb(10).gap(2).border_b_1().border_color(t.border)
+        .child(div().text_size(11).font_semibold().text_color(t.muted).child("ASSIGN TO"))
+        .child(div().text_size(13).truncate().child(p.title || "(untitled)")))
+      .child(v_flex().id("condoo-assign-list").flex_1().min_h(0).overflow_y_scrollbar().p(6)
+        .children(targets.map((target, i) => h_flex().id(`as-${i}`).h(30).px(10).gap(8).items_center().rounded(6).text_size(12.5)
+          .when(i === this.pick, (el) => el.bg(t.selected))
+          .hover((s) => (i === this.pick ? s : s.bg(t.hover)))
+          .on_click((_e, cx) => choose(target, cx))
+          .when(Boolean(target.status), (el) => el.child(div().flex_none().size(7).rounded(4)
+            .bg(t[target.status] ?? t.unknown)))
+          .child(div().flex_1().min_w(0).truncate().child(target.name))
+          .when(Boolean(target.note), (el) => el.child(div().flex_none().text_size(11).text_color(t.dim).child(target.note)))
+          .when(Boolean(target.address) && target.address === p.assignee, (el) => el.child(div().flex_none().text_size(11).text_color(t.accent).child("now"))))))
+      .child(div().flex_none().px(16).py(8).border_t_1().border_color(t.border).text_size(11).text_color(t.dim)
+        .child(this.assigning ? "Assigning…" : "j k move · enter assigns · esc cancels"));
   }
 
   help() {

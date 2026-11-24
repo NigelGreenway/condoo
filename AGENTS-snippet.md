@@ -50,7 +50,17 @@ Mark it done once it's resolved: `condoo set N --status completed`.
 
 Add progress notes to an item rather than rewriting its description:
 `condoo comment N "Done for menu-service; venue-service waits on #19" --agent "<your name> (<task>)"`.
-Their comments reach you as `Comment from <name> on condoo #N "...": ...`; `condoo get N`
-lists every comment (`comments`, oldest first). Don't add, change or
+Their comments reach you as `Comment from <name> on condoo #N "...": ...` (typed in when
+you're idle; several at once arrive as one `N updates from Condoo:` message); `condoo get N`
+lists every comment (`comments`, oldest first).
+
+## Assigned items
+
+They may assign you an item: `Condoo #N is assigned to you ...`. Work on it, and reply
+only with comments: progress, questions and the result, with
+`condoo comment N "..." --agent "<your name> (<task>)"`. Don't change its status or close
+it; they do that. Their comments on it reach you. If you raised the item yourself, you have
+its context: do it yourself, or give a sub-agent a brief with what it needs (sub-agents
+don't see your conversation). Don't add, change or
 delete their own tasks (`kind: task`) unless they ask. `condoo list` prints everything as
 JSON; `condoo --help` lists every command.

@@ -5,6 +5,8 @@
 //	name  CONDOO_NAME  > config "name" > the login name (DOMAIN\ stripped on Windows)
 //	db    CONDOO_DB    > config "db"   > the OS data folder (see DefaultDB)
 //	file  CONDOO_CONFIG > the OS config folder (see DefaultConfigFile)
+//	delivery.mode      CONDOO_DELIVERY_MODE     > config > "instant"
+//	delivery.interval  CONDOO_DELIVERY_INTERVAL > config > 30 (seconds)
 package config
 
 import (
@@ -15,8 +17,54 @@ import (
 	"os"
 	"os/user"
 	"path/filepath"
+	"slices"
+	"strconv"
 	"strings"
 )
+
+// DeliveryModes: how answers, comments and assignments reach agents.
+//
+//	instant   typed in as soon as they're saved, or the moment the agent next goes idle
+//	interval  only on the panel's timer, every delivery.interval seconds
+//	off       kept in the outbox; nothing is typed in
+var DeliveryModes = []string{"instant", "interval", "off"}
+
+const (
+	DefaultDeliveryMode     = "instant"
+	DefaultDeliveryInterval = 30
+	minDeliveryInterval     = 5
+)
+
+// DeliveryFile is config.json's "delivery" block.
+type DeliveryFile struct {
+	Mode     string `json:"mode,omitempty"`
+	Interval int    `json:"interval_seconds,omitempty"`
+}
+
+// Delivery is the resolved delivery settings.
+type Delivery struct {
+	Mode           string `json:"mode"`
+	ModeSource     string `json:"mode_source"` // env | config | default
+	Interval       int    `json:"interval_seconds"`
+	IntervalSource string `json:"interval_source"` // env | config | default
+}
+
+// CheckDeliveryMode refuses a mode Condoo doesn't know.
+func CheckDeliveryMode(m string) error {
+	if !slices.Contains(DeliveryModes, m) {
+		return fmt.Errorf("delivery mode must be one of %s", strings.Join(DeliveryModes, ", "))
+	}
+	return nil
+}
+
+// ParseDeliveryInterval reads a whole number of seconds, at least 5.
+func ParseDeliveryInterval(v string) (int, error) {
+	n, err := strconv.Atoi(strings.TrimSpace(v))
+	if err != nil || n < minDeliveryInterval {
+		return 0, fmt.Errorf("delivery interval must be a whole number of seconds, at least %d", minDeliveryInterval)
+	}
+	return n, nil
+}
 
 // Env reads an environment variable; tests pass their own.
 type Env func(string) string
@@ -30,17 +78,19 @@ type System struct {
 
 // File is config.json. Empty fields mean "use the default".
 type File struct {
-	Name string `json:"name,omitempty"`
-	DB   string `json:"db,omitempty"`
+	Name     string        `json:"name,omitempty"`
+	DB       string        `json:"db,omitempty"`
+	Delivery *DeliveryFile `json:"delivery,omitempty"`
 }
 
 // Resolved is what the CLI runs with, and what `condoo config` prints.
 type Resolved struct {
-	Name       string `json:"name"`
-	NameSource string `json:"name_source"` // env | config | login
-	DB         string `json:"db"`
-	DBSource   string `json:"db_source"` // env | config | default
-	ConfigFile string `json:"config"`
+	Name       string   `json:"name"`
+	NameSource string   `json:"name_source"` // env | config | login
+	DB         string   `json:"db"`
+	DBSource   string   `json:"db_source"` // env | config | default
+	Delivery   Delivery `json:"delivery"`
+	ConfigFile string   `json:"config"`
 }
 
 // DefaultConfigFile: where config.json lives on each OS.
@@ -178,6 +228,33 @@ func Resolve(s System, login func() string) (Resolved, error) {
 		r.DB, r.DBSource = expand(s, f.DB), "config"
 	default:
 		r.DB, r.DBSource = DefaultDB(s), "default"
+	}
+	var df DeliveryFile
+	if f.Delivery != nil {
+		df = *f.Delivery
+	}
+	r.Delivery = Delivery{Mode: DefaultDeliveryMode, ModeSource: "default", Interval: DefaultDeliveryInterval, IntervalSource: "default"}
+	switch {
+	case s.Env("CONDOO_DELIVERY_MODE") != "":
+		r.Delivery.Mode, r.Delivery.ModeSource = s.Env("CONDOO_DELIVERY_MODE"), "env"
+	case df.Mode != "":
+		r.Delivery.Mode, r.Delivery.ModeSource = df.Mode, "config"
+	}
+	if err := CheckDeliveryMode(r.Delivery.Mode); err != nil {
+		return r, fmt.Errorf("%s (from %s)", err, r.Delivery.ModeSource)
+	}
+	switch {
+	case s.Env("CONDOO_DELIVERY_INTERVAL") != "":
+		n, err := ParseDeliveryInterval(s.Env("CONDOO_DELIVERY_INTERVAL"))
+		if err != nil {
+			return r, fmt.Errorf("CONDOO_DELIVERY_INTERVAL: %w", err)
+		}
+		r.Delivery.Interval, r.Delivery.IntervalSource = n, "env"
+	case df.Interval != 0:
+		if df.Interval < minDeliveryInterval {
+			return r, fmt.Errorf("%s: delivery.interval_seconds must be at least %d", r.ConfigFile, minDeliveryInterval)
+		}
+		r.Delivery.Interval, r.Delivery.IntervalSource = df.Interval, "config"
 	}
 	return r, nil
 }

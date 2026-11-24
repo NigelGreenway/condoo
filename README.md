@@ -113,13 +113,31 @@ Closing a space never hides its items. They move under **Detached Spaces**, whic
 | `a` | add an item; `>` adds a sub-task |
 | `space` | show the description and comments |
 | `c` | comment on an item in your editor |
+| `A` | assign to an agent: a running one, or a new one in the item's space |
 | `s` `p` | change status / priority |
 | `m` | move to another space |
 | `f` | filter: open, each status, all |
 | `x` | delete |
 | `?` | every key |
 
-A yellow megaphone marks an item with comments: faint once you've read them, bright when an agent has commented since you last opened it. Your comment is also typed into the item's agent if it's idle.
+A yellow megaphone marks an item with comments: faint once you've read them, bright when an agent has commented since you last opened it.
+
+### Reaching agents
+
+Your answers, your comments and assignments are typed into the agent's terminal, so you never have to tell it to look. A comment goes to the item's assignee, else to the agent that raised it.
+
+If the agent is busy, the message waits in Condoo's outbox and goes in the moment it's idle again, with anything else waiting for it as one message. On an item's card:
+
+| Mark | Means |
+|---|---|
+| `⏳ queued` | waiting for the agent to be idle |
+| spinner, `Claude on it` | it reached the agent, which is at work and hasn't replied yet |
+| `● Claude needs you` | the agent is waiting on a prompt |
+| `✓ delivered` | it went in, and the agent stopped without replying |
+| bright megaphone | the agent replied with a comment you haven't read |
+| `✗ not delivered` | the agent has ended (assign the item to another one with `A`) | Queued messages are kept in the database, so nothing is lost if Herdr closes; they're sent while the panel is running.
+
+`A` gives an item to an agent. While the agent that raised the item is still running, it's at the top of the list: it has the item's context, so it's usually the best choice (it can still hand the work to a sub-agent with a brief). Or pick **New Claude Code** (or any installed agent) to start one in a new tab in the item's space with the item as its first message, or any other running agent. Agents answer only in comments; changing the status and closing the item stay with you.
 
 Answers and comments open in `$VISUAL` or `$EDITOR`. Without one set: `vim`, `vi` or `nano`, or on Windows `edit`, `nvim`, `vim`, `nano` or `notepad`, whichever is found first.
 
@@ -136,6 +154,8 @@ condoo set 12 --status completed
 condoo comment 12 "Done for menu-service" --agent "Claude (TICKET-123)"
 condoo comments 12                         # its comments (get includes them too)
 condoo move 12 --space <space id>          # with its sub-items; --space "" for none
+condoo assign 12 t7                        # give it to the agent in t7 (or: origin, new --run claude)
+condoo deliver                             # type queued messages into idle agents now
 condoo --help
 ```
 
@@ -148,9 +168,24 @@ condoo config                      # your name, the database, and where each cam
 condoo config set name "Ada"
 condoo config set db "~/Dropbox/condoo.sqlite"
 condoo config set name ""          # back to the default
+condoo config set delivery.mode interval
+condoo config set delivery.interval 60
 ```
 
-Environment variables override the config file: `CONDOO_NAME`, `CONDOO_DB`, `CONDOO_CONFIG`.
+`delivery` decides when messages go into agents:
+
+```json
+{ "delivery": { "mode": "instant", "interval_seconds": 30 } }
+```
+
+| `mode` | Messages go in |
+|---|---|
+| `instant` (default) | as soon as they're saved if the agent is idle, else the moment it goes idle; the timer catches anything missed |
+| `interval` | only on the panel's timer, every `interval_seconds` (at least 5) |
+| `off` | never by themselves; `condoo deliver` sends them |
+
+Environment variables override the config file: `CONDOO_NAME`, `CONDOO_DB`, `CONDOO_CONFIG`,
+`CONDOO_DELIVERY_MODE`, `CONDOO_DELIVERY_INTERVAL`.
 `CONDOO_AGENT` sets the default `--agent`.
 
 ## Where things live

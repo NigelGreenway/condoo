@@ -589,7 +589,8 @@ func rebuildTasks(tx *sql.Tx) error {
 		  summary      TEXT NOT NULL DEFAULT '',
 		  space        TEXT,
 		  space_name   TEXT,
-		  seen_at      REAL)`,
+		  seen_at      REAL,
+		  assignee     TEXT)`,
 		"INSERT INTO tasks_new SELECT * FROM tasks",
 		"DROP TABLE tasks",
 		"ALTER TABLE tasks_new RENAME TO tasks",
@@ -781,5 +782,65 @@ func TestComments(t *testing.T) {
 	s.db.QueryRow("SELECT count(*) FROM comments").Scan(&n)
 	if n != 0 {
 		t.Errorf("%d comments outlived their item", n)
+	}
+}
+
+// Two deliverers never send the same message: a claimed one is skipped until it's settled
+// or its claim goes stale.
+func TestOutboxClaim(t *testing.T) {
+	s := open(t)
+	task, _ := s.Add(NewTask{Title: "x"})
+	a, err := s.Enqueue(task.ID, "t7", "comment", "one")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Enqueue(task.ID, "t8", "answer", "two")
+	if _, err := s.Enqueue(task.ID, "t7", "shout", "x"); err == nil {
+		t.Error("accepted an unknown kind")
+	}
+	if _, err := s.Enqueue(task.ID, " ", "comment", "x"); err == nil {
+		t.Error("accepted no terminal")
+	}
+
+	first, err := s.Claim("t7", time.Minute)
+	if err != nil || len(first) != 1 || first[0].ID != a.ID {
+		t.Fatalf("claim t7: %v %v", first, err)
+	}
+	if again, _ := s.Claim("", time.Minute); len(again) != 1 || again[0].Terminal != "t8" {
+		t.Errorf("claimed twice: %v", again)
+	}
+	// The clock moves a second per call; a 0 stale time takes any claim over.
+	if over, _ := s.Claim("t7", 0); len(over) != 1 {
+		t.Errorf("stale claim not taken over: %v", over)
+	}
+	if err := s.Settle([]int64{a.ID}, "delivered", ""); err != nil {
+		t.Fatal(err)
+	}
+	if left, _ := s.Claim("t7", 0); len(left) != 0 {
+		t.Errorf("delivered one claimed again: %v", left)
+	}
+	got, _ := s.Get(task.ID)
+	if len(got.Outbox) != 1 || got.Outbox[0].Terminal != "t8" {
+		t.Errorf("outbox: %+v", got.Outbox)
+	}
+	if got.LastDelivery == nil || got.LastDelivery.ID != a.ID || got.LastDelivery.DeliveredAt == nil {
+		t.Errorf("last delivery: %+v", got.LastDelivery)
+	}
+	later, _ := s.Enqueue(task.ID, "t7", "comment", "three")
+	s.Settle([]int64{later.ID}, "delivered", "")
+	if all, _ := s.List(""); all[0].LastDelivery == nil || all[0].LastDelivery.ID != later.ID {
+		t.Errorf("listed last delivery: %+v", all[0].LastDelivery)
+	}
+	other, _ := s.Add(NewTask{Title: "y"})
+	if got, _ := s.Get(other.ID); got.LastDelivery != nil {
+		t.Errorf("undelivered item has a last delivery: %+v", got.LastDelivery)
+	}
+	if err := s.Delete(task.ID); err != nil {
+		t.Fatal(err)
+	}
+	var n int
+	s.db.QueryRow("SELECT count(*) FROM deliveries").Scan(&n)
+	if n != 0 {
+		t.Errorf("%d deliveries outlived their item", n)
 	}
 }

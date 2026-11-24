@@ -22,7 +22,9 @@ var (
 	Kinds      = []string{"request", "task", "question"}
 	// Fields that `set` may change.
 	Fields = []string{"title", "description", "status", "priority", "waiting_on", "agent", "terminal",
-		"kind", "parent_id", "answer", "summary", "space", "space_name"}
+		"kind", "parent_id", "answer", "summary", "space", "space_name", "assignee"}
+	// What a delivery carries to an agent.
+	DeliveryKinds = []string{"answer", "comment", "assign"}
 )
 
 // Task is one item, as JSON for the panel and agents.
@@ -48,8 +50,31 @@ type Task struct {
 	SpaceName *string `json:"space_name"`
 	// SeenAt is when the person last opened the item in the panel: agents' comments after it
 	// are unread.
-	SeenAt   *float64  `json:"seen_at"`
+	SeenAt *float64 `json:"seen_at"`
+	// Assignee is the terminal of the agent working on the item (set by `assign`); it gets
+	// the person's comments. Agent and Terminal stay who raised it.
+	Assignee *string   `json:"assignee"`
 	Comments []Comment `json:"comments"` // oldest first
+	// Outbox is what hasn't reached its agent yet: pending (queued until the agent is idle)
+	// or dead (its terminal is gone), oldest first.
+	Outbox []Delivery `json:"outbox"`
+	// LastDelivery is the latest message that did reach its agent, or nil: the panel shows
+	// the agent at work on it until it replies or goes idle.
+	LastDelivery *Delivery `json:"last_delivery"`
+}
+
+// Delivery is a message waiting to be typed into, or typed into, an agent's terminal.
+type Delivery struct {
+	ID          int64    `json:"id"`
+	TaskID      int64    `json:"task_id"`
+	Terminal    string   `json:"terminal"`
+	Kind        string   `json:"kind"` // answer | comment | assign
+	Body        string   `json:"body"`
+	State       string   `json:"state"` // pending | delivered | dead | discarded
+	Attempts    int      `json:"attempts"`
+	LastError   string   `json:"last_error"`
+	CreatedAt   float64  `json:"created_at"`
+	DeliveredAt *float64 `json:"delivered_at"`
 }
 
 // Comment is one note on an item, by the person or an agent.
@@ -232,6 +257,29 @@ var migrations = []migration{
 		}
 		return nil
 	}},
+	// 2: the outbox for messages to agents, and who an item is assigned to.
+	{run: func(tx *sql.Tx) error {
+		if _, err := tx.Exec(`
+CREATE TABLE deliveries (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  task_id      INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  terminal     TEXT NOT NULL,
+  kind         TEXT NOT NULL,
+  body         TEXT NOT NULL,
+  state        TEXT NOT NULL DEFAULT 'pending',
+  attempts     INTEGER NOT NULL DEFAULT 0,
+  last_error   TEXT NOT NULL DEFAULT '',
+  claimed_at   REAL,
+  created_at   REAL NOT NULL,
+  delivered_at REAL
+);
+CREATE INDEX deliveries_state ON deliveries(state, terminal);
+CREATE INDEX deliveries_task ON deliveries(task_id);
+ALTER TABLE tasks ADD COLUMN assignee TEXT;`); err != nil {
+			return fmt.Errorf("create the outbox: %w", err)
+		}
+		return nil
+	}},
 }
 
 // runMigration applies one step and records its version in one transaction, so a failed
@@ -320,7 +368,7 @@ func Check(field, value string) error {
 }
 
 const columns = "id, parent_id, kind, title, description, status, priority, waiting_on, agent, terminal," +
-	" created_at, updated_at, status_since, answer, summary, space, space_name, seen_at"
+	" created_at, updated_at, status_since, answer, summary, space, space_name, seen_at, assignee"
 
 type scanner interface{ Scan(...any) error }
 
@@ -329,12 +377,13 @@ func scan(r scanner) (*Task, error) {
 		t                         Task
 		parent                    sql.NullInt64
 		agent, term, answer, spce sql.NullString
+		assignee                  sql.NullString
 		spaceName                 sql.NullString
 		summary, waiting          sql.NullString
 		seen                      sql.NullFloat64
 	)
 	err := r.Scan(&t.ID, &parent, &t.Kind, &t.Title, &t.Description, &t.Status, &t.Priority, &waiting,
-		&agent, &term, &t.CreatedAt, &t.UpdatedAt, &t.StatusSince, &answer, &summary, &spce, &spaceName, &seen)
+		&agent, &term, &t.CreatedAt, &t.UpdatedAt, &t.StatusSince, &answer, &summary, &spce, &spaceName, &seen, &assignee)
 	if err != nil {
 		return nil, err
 	}
@@ -342,11 +391,11 @@ func scan(r scanner) (*Task, error) {
 		t.ParentID = &parent.Int64
 	}
 	t.Agent, t.Terminal, t.Answer, t.Space, t.SpaceName = ptr(agent), ptr(term), ptr(answer), ptr(spce), ptr(spaceName)
-	t.Summary, t.WaitingOn = summary.String, waiting.String
+	t.Summary, t.WaitingOn, t.Assignee = summary.String, waiting.String, ptr(assignee)
 	if seen.Valid {
 		t.SeenAt = &seen.Float64
 	}
-	t.Comments = []Comment{}
+	t.Comments, t.Outbox = []Comment{}, []Delivery{}
 	return &t, nil
 }
 
@@ -371,6 +420,18 @@ func (s *Store) Get(id int64) (*Task, error) {
 		return nil, err
 	}
 	t.Comments = append(t.Comments, byTask[id]...)
+	outbox, err := s.deliveries("WHERE task_id = ? AND state IN ('pending', 'dead')", id)
+	if err != nil {
+		return nil, err
+	}
+	t.Outbox = append(t.Outbox, outbox[id]...)
+	last, err := s.deliveries(lastDelivered+" AND task_id = ?", id)
+	if err != nil {
+		return nil, err
+	}
+	if l := last[id]; len(l) > 0 {
+		t.LastDelivery = &l[0]
+	}
 	return t, nil
 }
 
@@ -421,8 +482,20 @@ func (s *Store) List(kind string) ([]Task, error) {
 	if err != nil {
 		return nil, err
 	}
+	outbox, err := s.deliveries("WHERE state IN ('pending', 'dead')")
+	if err != nil {
+		return nil, err
+	}
+	last, err := s.deliveries(lastDelivered)
+	if err != nil {
+		return nil, err
+	}
 	for i := range out {
+		if l := last[out[i].ID]; len(l) > 0 {
+			out[i].LastDelivery = &l[0]
+		}
 		out[i].Comments = append(out[i].Comments, byTask[out[i].ID]...)
+		out[i].Outbox = append(out[i].Outbox, outbox[out[i].ID]...)
 	}
 	return out, nil
 }

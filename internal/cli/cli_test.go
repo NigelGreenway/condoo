@@ -324,9 +324,11 @@ func TestEditor(t *testing.T) {
 func TestSpaceInAndName(t *testing.T) {
 	ls := []byte(`{"spaces":[
 	  {"id":"s1","name":"core","tabs":[{"terminals":[{"terminal":"t1"}]}]},
-	  {"id":"s2","name":"condoo","tabs":[{"terminals":[]},{"terminals":[{"terminal":"t2","sub_agents":[{"terminal":"t9","sub_agents":[{"terminal":"t10"}]}]}]}]}]}`)
+	  {"id":"s2","name":"condoo","tabs":[{"terminals":[]},{"terminals":[{"terminal":"t2","sub_agents":[{"terminal":"t9","sub_agents":[{"terminal":"t10"}]}]}]}]},
+	  {"id":"s3","name":"live","tabs":[{"terminals":[{"terminal":"t7s","sub_agents":["t10c","t8g"]}]}]}]}`)
 	for term, want := range map[string][2]string{
 		"t1": {"s1", "core"}, "t2": {"s2", "condoo"}, "t9": {"s2", "condoo"}, "t10": {"s2", "condoo"},
+		"t10c": {"s3", "live"}, // how Herdr lists sub-agents today: their addresses
 		"t404": {"", ""}, "": {"", ""},
 	} {
 		if id, name := SpaceIn(ls, term); id != want[0] || name != want[1] {
